@@ -3,10 +3,10 @@
 
 #[cfg(feature = "fuse")]
 fn main() {
-    use permfs::mock::TestFsBuilder;
     use permfs::fuse::FuseFs;
-    use std::sync::Arc;
+    use permfs::mock::TestFsBuilder;
     use std::path::Path;
+    use std::sync::Arc;
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
@@ -30,7 +30,10 @@ fn main() {
 
     println!("Filesystem created:");
     println!("  Total blocks: {}", sb.total_blocks);
-    println!("  Free blocks:  {}", sb.free_blocks.load(std::sync::atomic::Ordering::Relaxed));
+    println!(
+        "  Free blocks:  {}",
+        sb.free_blocks.load(std::sync::atomic::Ordering::Relaxed)
+    );
 
     println!("Mounting at {}...", mountpoint.display());
     let fuse_fs = FuseFs::new(Arc::new(fs), sb);
@@ -39,7 +42,8 @@ fn main() {
     ctrlc::set_handler(move || {
         println!("\nUnmounting...");
         std::process::exit(0);
-    }).expect("Error setting Ctrl+C handler");
+    })
+    .expect("Error setting Ctrl+C handler");
 
     if let Err(e) = fuse_fs.mount(mountpoint) {
         eprintln!("Mount failed: {}", e);

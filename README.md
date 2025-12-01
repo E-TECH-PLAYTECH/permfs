@@ -160,6 +160,9 @@ cargo test
 
 # Run example
 cargo run --example test_fs
+
+# Validate `no_std` + `alloc` build used by the `kernel` feature
+cargo +nightly check -Zbuild-std=core,alloc --no-default-features --features kernel
 ```
 
 ## Filesystem Layout

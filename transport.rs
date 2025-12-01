@@ -2,14 +2,13 @@
 
 #![cfg(feature = "network")]
 
-use crate::{BlockAddr, AllocError, FsResult, IoError, ClusterTransport, BLOCK_SIZE};
-use parking_lot::{RwLock, Mutex};
-use socket2::{Socket, Domain, Type, Protocol, SockAddr};
+use crate::sync::{Arc, Mutex, RwLock};
+use crate::{AllocError, BlockAddr, ClusterTransport, FsResult, IoError, BLOCK_SIZE};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream, TcpListener, Ipv4Addr, IpAddr};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
 // ============================================================================
@@ -38,14 +37,14 @@ pub enum MessageType {
     WriteBlock = 0x0002,
     AllocBlock = 0x0003,
     FreeBlock = 0x0004,
-    
+
     // Responses
     ReadReply = 0x0101,
     WriteAck = 0x0102,
     AllocReply = 0x0103,
     FreeAck = 0x0104,
     Error = 0x01FF,
-    
+
     // Cluster management
     Ping = 0x0200,
     Pong = 0x0201,
@@ -165,12 +164,15 @@ impl NodeRegistry {
 
     pub fn register(&self, node_id: u64, address: SocketAddr) {
         let mut nodes = self.nodes.write();
-        nodes.insert(node_id, NodeInfo {
+        nodes.insert(
             node_id,
-            address,
-            last_seen: 0,
-            is_healthy: true,
-        });
+            NodeInfo {
+                node_id,
+                address,
+                last_seen: 0,
+                is_healthy: true,
+            },
+        );
     }
 
     pub fn unregister(&self, node_id: u64) {
@@ -199,7 +201,8 @@ impl NodeRegistry {
 
     pub fn all_healthy(&self) -> Vec<NodeInfo> {
         let nodes = self.nodes.read();
-        nodes.values()
+        nodes
+            .values()
             .filter(|n| n.is_healthy && n.node_id != self.local_node_id)
             .cloned()
             .collect()
@@ -248,10 +251,10 @@ impl ConnectionPool {
     pub fn put(&self, node_id: u64, stream: TcpStream) {
         let mut pool = self.connections.lock();
         let conns = pool.entry(node_id).or_insert_with(Vec::new);
-        
+
         // Prune old connections
         conns.retain(|c| c.last_used.elapsed() < self.idle_timeout);
-        
+
         if conns.len() < self.max_per_node {
             conns.push(PooledConnection {
                 stream,
@@ -304,8 +307,7 @@ impl TcpTransport {
         }
 
         // Get node address
-        let info = self.registry.get(node_id)
-            .ok_or(IoError::NetworkTimeout)?;
+        let info = self.registry.get(node_id).ok_or(IoError::NetworkTimeout)?;
 
         if !info.is_healthy {
             return Err(IoError::NetworkTimeout);
@@ -317,28 +319,40 @@ impl TcpTransport {
 
         socket.set_nodelay(true).ok();
         socket.set_keepalive(true).ok();
-        
+
         let sock_addr = SockAddr::from(info.address);
-        socket.connect_timeout(&sock_addr, Duration::from_millis(CONNECTION_TIMEOUT_MS))
+        socket
+            .connect_timeout(&sock_addr, Duration::from_millis(CONNECTION_TIMEOUT_MS))
             .map_err(|_| IoError::NetworkTimeout)?;
 
         let stream: TcpStream = socket.into();
-        stream.set_read_timeout(Some(Duration::from_millis(READ_TIMEOUT_MS))).ok();
-        stream.set_write_timeout(Some(Duration::from_millis(WRITE_TIMEOUT_MS))).ok();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(READ_TIMEOUT_MS)))
+            .ok();
+        stream
+            .set_write_timeout(Some(Duration::from_millis(WRITE_TIMEOUT_MS)))
+            .ok();
 
         Ok(stream)
     }
 
-    fn send_request(&self, node_id: u64, header: &MessageHeader, payload: &[u8]) -> Result<TcpStream, IoError> {
+    fn send_request(
+        &self,
+        node_id: u64,
+        header: &MessageHeader,
+        payload: &[u8],
+    ) -> Result<TcpStream, IoError> {
         let mut stream = self.connect(node_id)?;
 
         let header_bytes = header.to_bytes();
-        stream.write_all(&header_bytes).map_err(|_| IoError::IoFailed)?;
-        
+        stream
+            .write_all(&header_bytes)
+            .map_err(|_| IoError::IoFailed)?;
+
         if !payload.is_empty() {
             stream.write_all(payload).map_err(|_| IoError::IoFailed)?;
         }
-        
+
         stream.flush().map_err(|_| IoError::IoFailed)?;
 
         Ok(stream)
@@ -346,7 +360,9 @@ impl TcpTransport {
 
     fn recv_response(&self, stream: &mut TcpStream) -> Result<(MessageHeader, Vec<u8>), IoError> {
         let mut header_buf = [0u8; MessageHeader::SIZE];
-        stream.read_exact(&mut header_buf).map_err(|_| IoError::NetworkTimeout)?;
+        stream
+            .read_exact(&mut header_buf)
+            .map_err(|_| IoError::NetworkTimeout)?;
 
         let header = MessageHeader::from_bytes(&header_buf);
         if !header.is_valid() {
@@ -355,7 +371,9 @@ impl TcpTransport {
 
         let mut payload = vec![0u8; header.payload_len as usize];
         if header.payload_len > 0 {
-            stream.read_exact(&mut payload).map_err(|_| IoError::NetworkTimeout)?;
+            stream
+                .read_exact(&mut payload)
+                .map_err(|_| IoError::NetworkTimeout)?;
         }
 
         Ok((header, payload))
@@ -366,7 +384,7 @@ impl TcpTransport {
         F: FnMut(&Self, u64) -> Result<R, IoError>,
     {
         let mut last_err = IoError::NetworkTimeout;
-        
+
         for attempt in 0..MAX_RETRY_ATTEMPTS {
             match op(self, node_id) {
                 Ok(result) => {
@@ -377,7 +395,9 @@ impl TcpTransport {
                     last_err = e;
                     if attempt + 1 < MAX_RETRY_ATTEMPTS {
                         self.pool.remove(node_id);
-                        std::thread::sleep(Duration::from_millis(RETRY_DELAY_MS * (attempt as u64 + 1)));
+                        std::thread::sleep(Duration::from_millis(
+                            RETRY_DELAY_MS * (attempt as u64 + 1),
+                        ));
                     }
                 }
             }
@@ -451,17 +471,15 @@ impl ClusterTransport for TcpTransport {
     fn alloc_remote(&self, node: u64, volume: u32) -> Result<BlockAddr, AllocError> {
         self.execute_with_retry(node, |this, node_id| {
             let payload = volume.to_le_bytes();
-            let mut header = MessageHeader::new(
-                MessageType::AllocBlock,
-                this.local_node_id,
-                node_id,
-                4,
-            );
+            let mut header =
+                MessageHeader::new(MessageType::AllocBlock, this.local_node_id, node_id, 4);
             header.request_id = this.next_request_id();
 
-            let mut stream = this.send_request(node_id, &header, &payload)
+            let mut stream = this
+                .send_request(node_id, &header, &payload)
                 .map_err(|_| IoError::NetworkTimeout)?;
-            let (resp_header, resp_payload) = this.recv_response(&mut stream)
+            let (resp_header, resp_payload) = this
+                .recv_response(&mut stream)
                 .map_err(|_| IoError::NetworkTimeout)?;
 
             let msg_type = MessageType::from_u16(resp_header.msg_type);
@@ -480,23 +498,22 @@ impl ClusterTransport for TcpTransport {
                 Some(MessageType::Error) => Err(IoError::IoFailed),
                 _ => Err(IoError::Corrupted),
             }
-        }).map_err(|_| AllocError::NetworkError)
+        })
+        .map_err(|_| AllocError::NetworkError)
     }
 
     fn free_remote(&self, node: u64, addr: BlockAddr) -> Result<(), AllocError> {
         self.execute_with_retry(node, |this, node_id| {
             let payload = addr.to_bytes();
-            let mut header = MessageHeader::new(
-                MessageType::FreeBlock,
-                this.local_node_id,
-                node_id,
-                32,
-            );
+            let mut header =
+                MessageHeader::new(MessageType::FreeBlock, this.local_node_id, node_id, 32);
             header.request_id = this.next_request_id();
 
-            let mut stream = this.send_request(node_id, &header, &payload)
+            let mut stream = this
+                .send_request(node_id, &header, &payload)
                 .map_err(|_| IoError::NetworkTimeout)?;
-            let (resp_header, _) = this.recv_response(&mut stream)
+            let (resp_header, _) = this
+                .recv_response(&mut stream)
                 .map_err(|_| IoError::NetworkTimeout)?;
 
             let msg_type = MessageType::from_u16(resp_header.msg_type);
@@ -508,7 +525,8 @@ impl ClusterTransport for TcpTransport {
                 Some(MessageType::Error) => Err(IoError::IoFailed),
                 _ => Err(IoError::Corrupted),
             }
-        }).map_err(|_| AllocError::NetworkError)
+        })
+        .map_err(|_| AllocError::NetworkError)
     }
 }
 
@@ -534,7 +552,7 @@ impl TcpServer {
     pub fn bind(local_node_id: u64, addr: SocketAddr) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(false)?;
-        
+
         Ok(Self {
             local_node_id,
             listener,
@@ -560,9 +578,17 @@ impl TcpServer {
         }
     }
 
-    fn handle_connection<H: RequestHandler>(local_node_id: u64, mut stream: TcpStream, handler: Arc<H>) {
-        stream.set_read_timeout(Some(Duration::from_millis(READ_TIMEOUT_MS))).ok();
-        stream.set_write_timeout(Some(Duration::from_millis(WRITE_TIMEOUT_MS))).ok();
+    fn handle_connection<H: RequestHandler>(
+        local_node_id: u64,
+        mut stream: TcpStream,
+        handler: Arc<H>,
+    ) {
+        stream
+            .set_read_timeout(Some(Duration::from_millis(READ_TIMEOUT_MS)))
+            .ok();
+        stream
+            .set_write_timeout(Some(Duration::from_millis(WRITE_TIMEOUT_MS)))
+            .ok();
 
         loop {
             // Read header
@@ -629,9 +655,7 @@ impl TcpServer {
                         }
                     }
                 }
-                Some(MessageType::Ping) => {
-                    (MessageType::Pong, Vec::new())
-                }
+                Some(MessageType::Ping) => (MessageType::Pong, Vec::new()),
                 _ => (MessageType::Error, Vec::new()),
             };
 
@@ -669,7 +693,7 @@ mod tests {
         let header = MessageHeader::new(MessageType::ReadBlock, 123, 456, 100);
         let bytes = header.to_bytes();
         let recovered = MessageHeader::from_bytes(&bytes);
-        
+
         assert_eq!(header.magic, recovered.magic);
         assert_eq!(header.msg_type, recovered.msg_type);
         assert_eq!(header.source_node, recovered.source_node);
@@ -680,17 +704,17 @@ mod tests {
     #[test]
     fn test_node_registry() {
         let registry = NodeRegistry::new(1);
-        
+
         registry.register(2, "127.0.0.1:7432".parse().unwrap());
         registry.register(3, "127.0.0.1:7433".parse().unwrap());
-        
+
         assert!(registry.get(2).is_some());
         assert!(registry.get(3).is_some());
         assert!(registry.get(4).is_none());
-        
+
         registry.mark_healthy(2, false);
         assert!(!registry.get(2).unwrap().is_healthy);
-        
+
         let healthy = registry.all_healthy();
         assert_eq!(healthy.len(), 1);
         assert_eq!(healthy[0].node_id, 3);

@@ -9,7 +9,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 //
 // Block 0:          Superblock
 // Block 1..N:       Inode bitmap (N = ceil(total_inodes / (BLOCK_SIZE * 8)))
-// Block N+1..M:     Block bitmap (M-N = ceil(total_blocks / (BLOCK_SIZE * 8)))  
+// Block N+1..M:     Block bitmap (M-N = ceil(total_blocks / (BLOCK_SIZE * 8)))
 // Block M+1..K:     Inode table (K-M = ceil(total_inodes / inodes_per_block))
 // Block K+1..J:     Journal (configurable size)
 // Block J+1..:      Data blocks
@@ -19,8 +19,8 @@ pub struct MkfsParams {
     pub node_id: u64,
     pub volume_id: u32,
     pub total_blocks: u64,
-    pub inode_ratio: u64,      // bytes per inode (default: 16384)
-    pub journal_blocks: u64,   // journal size (default: 1024 = 4 MiB)
+    pub inode_ratio: u64,    // bytes per inode (default: 16384)
+    pub journal_blocks: u64, // journal size (default: 1024 = 4 MiB)
     pub volume_name: [u8; 64],
     pub uuid: [u8; 16],
 }
@@ -91,7 +91,7 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
             volume_name: params.volume_name,
             mount_count: 0,
             max_mount_count: 20,
-            state: 1, // clean
+            state: 1,           // clean
             errors_behavior: 1, // continue
             first_inode_table: BlockAddr::new(
                 params.node_id,
@@ -99,12 +99,7 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
                 0,
                 inode_table_start,
             ),
-            journal_start: BlockAddr::new(
-                params.node_id,
-                params.volume_id,
-                0,
-                journal_start,
-            ),
+            journal_start: BlockAddr::new(params.node_id, params.volume_id, 0, journal_start),
             root_inode: 0,
             checksum: 0,
         };
@@ -187,12 +182,7 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         }
     }
 
-    fn init_inode_bitmap(
-        &self,
-        params: &MkfsParams,
-        start: u64,
-        blocks: u64,
-    ) -> FsResult<()> {
+    fn init_inode_bitmap(&self, params: &MkfsParams, start: u64, blocks: u64) -> FsResult<()> {
         let mut buf = [0u8; BLOCK_SIZE];
 
         for i in 0..blocks {
@@ -252,9 +242,9 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
             params.node_id,
             params.volume_id,
             0,
-            sb.first_inode_table.block_offset() 
-                + (sb.total_inodes + (BLOCK_SIZE / Inode::SIZE) as u64 - 1) 
-                  / (BLOCK_SIZE / Inode::SIZE) as u64
+            sb.first_inode_table.block_offset()
+                + (sb.total_inodes + (BLOCK_SIZE / Inode::SIZE) as u64 - 1)
+                    / (BLOCK_SIZE / Inode::SIZE) as u64
                 + params.journal_blocks,
         );
 
@@ -288,7 +278,7 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
     }
 
     fn init_journal(&self, params: &MkfsParams, start: u64) -> FsResult<()> {
-        use crate::journal::{JournalHeader, JOURNAL_MAGIC, TxState};
+        use crate::journal::{JournalHeader, TxState, JOURNAL_MAGIC};
 
         let header = JournalHeader {
             magic: JOURNAL_MAGIC,

@@ -4,15 +4,18 @@
 //! healthier flash wear leveling.
 #![cfg(feature = "std")]
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use crate::sync::{Arc, Mutex};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::journal::{AllocationRecordKind, Journal, JournalError};
 use crate::panic_support::{
     allocator_event_window, record_allocator_event, register_allocator_reporter, AllocatorEvent,
     AllocatorEventKind, AllocatorPanicReport, AllocatorPanicReporter,
 };
+use crate::time::Clock;
 use crate::{AllocError, BlockAddr, BlockDevice, VolumeAllocator, BLOCKS_PER_SHARD};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 /// Tunables controlling cache sizing, trim batching, and queue admission.
 #[derive(Clone, Debug)]
@@ -147,7 +150,7 @@ pub struct CachedVolumeAllocator<B: BlockDevice> {
     pressure_threshold: u64,
 }
 
-impl<B: BlockDevice> CachedVolumeAllocator<B> {
+impl<B: BlockDevice + 'static> CachedVolumeAllocator<B> {
     pub fn new(
         volume: VolumeAllocator,
         device: Arc<B>,
@@ -179,8 +182,9 @@ impl<B: BlockDevice> CachedVolumeAllocator<B> {
     }
 
     fn cache_index(&self) -> usize {
-        let id = std::thread::current().id().as_u64().get();
-        id as usize % self.caches.len()
+        let mut hasher = DefaultHasher::new();
+        std::thread::current().id().hash(&mut hasher);
+        (hasher.finish() as usize) % self.caches.len()
     }
 
     fn admit(&self) {
@@ -374,7 +378,7 @@ impl<B: BlockDevice> CachedVolumeAllocator<B> {
 
     /// Leak and register this allocator as the panic reporter.
     pub fn register_for_panic(self: &Arc<Self>) {
-        let leaked: &'static Self = Arc::leak(self.clone());
+        let leaked: &'static Self = unsafe { &*Arc::into_raw(self.clone()) };
         register_allocator_reporter(Some(leaked));
     }
 

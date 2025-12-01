@@ -5,14 +5,16 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![allow(unused_unsafe)]
 
+#[cfg(all(not(feature = "std"), not(feature = "alloc")))]
+compile_error!("permfs requires the `alloc` feature when `std` is disabled");
+
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
-#[cfg(not(feature = "std"))]
+#[cfg(feature = "alloc")]
 use alloc::{boxed::Box, string::String, vec::Vec};
-#[cfg(feature = "std")]
-use std::{boxed::Box, string::String, vec::Vec};
 
+#[cfg(feature = "alloc")]
 use crate::panic_support::{record_allocator_event, AllocatorEvent, AllocatorEventKind};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -39,20 +41,31 @@ macro_rules! log_error {
 
 #[cfg(feature = "std")]
 pub mod allocator;
+#[cfg(feature = "alloc")]
 pub mod checksum;
+#[cfg(feature = "alloc")]
 pub mod dir;
-pub mod dlm;
+#[cfg(feature = "std")]
 pub mod dlm;
 #[cfg(feature = "std")]
 pub mod drivers;
+#[cfg(feature = "alloc")]
 pub mod extent;
-pub mod extent;
+#[cfg(feature = "alloc")]
 pub mod journal;
+#[cfg(feature = "alloc")]
 pub mod mkfs;
+#[cfg(feature = "alloc")]
 pub mod ops;
+#[cfg(feature = "alloc")]
 pub mod os_porting;
+#[cfg(feature = "alloc")]
 pub mod panic_support;
+#[cfg(feature = "alloc")]
+pub mod sync;
+#[cfg(feature = "alloc")]
 pub mod time;
+#[cfg(feature = "alloc")]
 pub mod write;
 
 #[cfg(feature = "fuse")]
@@ -67,11 +80,11 @@ pub mod vfs;
 // Re-exports
 #[cfg(feature = "std")]
 pub use allocator::{AllocatorConfig, AllocatorSnapshot, CachedVolumeAllocator};
-pub use checksum::{compute_inode_checksum, compute_superblock_checksum, crc32c, verify_checksum};
-pub use checksum::{compute_inode_checksum, compute_superblock_checksum, crc32c, verify_checksum};
+#[cfg(feature = "alloc")]
 pub use checksum::{compute_inode_checksum, compute_superblock_checksum, crc32c, verify_checksum};
 #[cfg(feature = "std")]
 pub use drivers::block_device::{BlockDeviceParams, ChecksumHook, OsBlockDevice};
+#[cfg(feature = "alloc")]
 pub use time::Clock;
 
 // ============================================================================

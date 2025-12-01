@@ -73,9 +73,7 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
 
             let mut pos = 0usize;
             while pos + DirEntry::HEADER_SIZE <= BLOCK_SIZE {
-                let entry = unsafe {
-                    &*(buf.as_ptr().add(pos) as *const DirEntry)
-                };
+                let entry = unsafe { &*(buf.as_ptr().add(pos) as *const DirEntry) };
 
                 if entry.rec_len == 0 {
                     break; // End of entries in this block
@@ -136,7 +134,8 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         }
 
         // No space in existing blocks — allocate new block
-        let new_block = self.alloc_block(Some(sb.volume_id))
+        let new_block = self
+            .alloc_block(Some(sb.volume_id))
             .map_err(|_| IoError::IoFailed)?;
 
         // Initialize new directory block
@@ -152,14 +151,15 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
 
         // Set rec_len to fill rest of block (last entry convention)
         let rec_len_offset = 8; // offset of rec_len in DirEntry
-        let fill_len = (BLOCK_SIZE - DirEntry::entry_size(name.len())) as u16 
-                       + DirEntry::entry_size(name.len()) as u16;
+        let fill_len = (BLOCK_SIZE - DirEntry::entry_size(name.len())) as u16
+            + DirEntry::entry_size(name.len()) as u16;
         buf[rec_len_offset..rec_len_offset + 2].copy_from_slice(&fill_len.to_le_bytes());
 
         self.write_block(new_block, &buf)?;
 
         // Update inode to point to new block
-        self.set_block_for_offset(&mut parent, parent.size, new_block, sb)?;
+        let parent_size = parent.size;
+        self.set_block_for_offset(&mut parent, parent_size, new_block, sb)?;
         parent.size += BLOCK_SIZE as u64;
         parent.blocks += 1;
         parent.mtime = self.current_time();
@@ -183,30 +183,26 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
             let mut prev_pos: Option<usize> = None;
 
             while pos + DirEntry::HEADER_SIZE <= BLOCK_SIZE {
-                let entry = unsafe {
-                    &*(buf.as_ptr().add(pos) as *const DirEntry)
-                };
+                let entry = unsafe { &*(buf.as_ptr().add(pos) as *const DirEntry) };
 
                 if entry.rec_len == 0 {
                     break;
                 }
 
-                if !entry.is_deleted() 
+                if !entry.is_deleted()
                     && entry.name_len as usize == name.len()
-                    && &entry.name[..name.len()] == name 
+                    && &entry.name[..name.len()] == name
                 {
                     // Found it — mark as deleted
                     if let Some(prev) = prev_pos {
                         // Merge with previous entry
-                        let prev_entry = unsafe {
-                            &mut *(buf.as_mut_ptr().add(prev) as *mut DirEntry)
-                        };
+                        let prev_entry =
+                            unsafe { &mut *(buf.as_mut_ptr().add(prev) as *mut DirEntry) };
                         prev_entry.rec_len += entry.rec_len;
                     } else {
                         // First entry — just zero the inode
-                        let entry_mut = unsafe {
-                            &mut *(buf.as_mut_ptr().add(pos) as *mut DirEntry)
-                        };
+                        let entry_mut =
+                            unsafe { &mut *(buf.as_mut_ptr().add(pos) as *mut DirEntry) };
                         entry_mut.inode = 0;
                     }
 
@@ -245,9 +241,8 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         let dotdot = DirEntry::new(parent_ino, b"..", file_type::DIRECTORY);
 
         // Write "."
-        let dot_bytes = unsafe {
-            core::slice::from_raw_parts(&dot as *const _ as *const u8, dot_size)
-        };
+        let dot_bytes =
+            unsafe { core::slice::from_raw_parts(&dot as *const _ as *const u8, dot_size) };
         buf[..dot_size].copy_from_slice(dot_bytes);
         // Patch rec_len for "."
         buf[8..10].copy_from_slice(&(dot_size as u16).to_le_bytes());
@@ -276,9 +271,7 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
 
             let mut pos = 0usize;
             while pos + DirEntry::HEADER_SIZE <= BLOCK_SIZE {
-                let entry = unsafe {
-                    &*(buf.as_ptr().add(pos) as *const DirEntry)
-                };
+                let entry = unsafe { &*(buf.as_ptr().add(pos) as *const DirEntry) };
 
                 if entry.rec_len == 0 {
                     break;
@@ -310,9 +303,7 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         let mut pos = 0usize;
 
         while pos + DirEntry::HEADER_SIZE <= BLOCK_SIZE {
-            let entry = unsafe {
-                &*(buf.as_ptr().add(pos) as *const DirEntry)
-            };
+            let entry = unsafe { &*(buf.as_ptr().add(pos) as *const DirEntry) };
 
             if entry.rec_len == 0 {
                 // End of entries — check remaining space
@@ -348,9 +339,7 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         new_entry: &DirEntry,
         needed_size: usize,
     ) {
-        let existing = unsafe {
-            &mut *(buf.as_mut_ptr().add(pos) as *mut DirEntry)
-        };
+        let existing = unsafe { &mut *(buf.as_mut_ptr().add(pos) as *mut DirEntry) };
 
         if existing.rec_len == 0 || existing.is_deleted() {
             // Empty slot — just write

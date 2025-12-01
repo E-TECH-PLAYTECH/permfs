@@ -7,14 +7,14 @@
 
 #![cfg(feature = "std")]
 
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::io::{ErrorKind, Result as IoResult};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::panic_support::{register_panic_quiesce, PanicQuiesce, PanicQuiesceResult};
+use crate::sync::Arc;
 use crate::{BlockAddr, BlockDevice, FsResult, IoError, BLOCK_SIZE};
 
 /// Hook signature used to validate buffers before/after I/O.
@@ -137,7 +137,7 @@ impl OsBlockDevice {
     }
 }
 
-impl<B: BlockBackend> OsBlockDevice<B> {
+impl<B: BlockBackend + 'static> OsBlockDevice<B> {
     pub fn from_backend(backend: B, params: BlockDeviceParams) -> Self {
         Self {
             backend,
@@ -150,7 +150,7 @@ impl<B: BlockBackend> OsBlockDevice<B> {
 
     /// Leak the device reference and register it for panic quiesce handling.
     pub fn register_for_panic(self: &Arc<Self>) {
-        let leaked: &'static Self = Arc::leak(self.clone());
+        let leaked: &'static Self = unsafe { &*Arc::into_raw(self.clone()) };
         register_panic_quiesce(Some(leaked));
     }
 
@@ -228,7 +228,7 @@ impl<B: BlockBackend> OsBlockDevice<B> {
     }
 }
 
-impl<B: BlockBackend> BlockDevice for OsBlockDevice<B> {
+impl<B: BlockBackend + 'static> BlockDevice for OsBlockDevice<B> {
     fn read_block(&self, addr: BlockAddr, buf: &mut [u8; BLOCK_SIZE]) -> FsResult<()> {
         let offset = self.validate_address(addr)?;
         self.retry_io(|| self.backend.read_aligned(offset, buf))?;
@@ -331,21 +331,21 @@ fn map_io_error(err: std::io::Error) -> IoError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::sync::atomic::{AtomicUsize, Ordering};
     use std::fs::OpenOptions;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
 
     #[derive(Clone)]
     struct MockBackend {
         fail_writes: bool,
-        storage: Arc<std::sync::Mutex<Vec<u8>>>,
+        storage: Arc<crate::sync::Mutex<Vec<u8>>>,
     }
 
     impl MockBackend {
         fn new(blocks: usize, fail_writes: bool) -> Self {
             Self {
                 fail_writes,
-                storage: Arc::new(std::sync::Mutex::new(vec![0u8; blocks * BLOCK_SIZE])),
+                storage: Arc::new(crate::sync::Mutex::new(vec![0u8; blocks * BLOCK_SIZE])),
             }
         }
     }
