@@ -15,6 +15,54 @@ pub enum TxState {
     Checkpointed = 3,
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AllocationRecordKind {
+    Allocation = 1,
+    Free = 2,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AllocationRecord {
+    pub kind: AllocationRecordKind,
+    pub addr: BlockAddr,
+    pub count: u32,
+    pub timestamp: u64,
+}
+
+impl AllocationRecord {
+    pub const SIZE: usize = 48;
+
+    pub fn serialize(&self, buf: &mut [u8]) {
+        buf[0] = self.kind as u8;
+        buf[1..33].copy_from_slice(&self.addr.to_bytes());
+        buf[33..37].copy_from_slice(&self.count.to_le_bytes());
+        buf[40..48].copy_from_slice(&self.timestamp.to_le_bytes());
+    }
+
+    pub fn deserialize(buf: &[u8]) -> Self {
+        let kind = match buf[0] {
+            1 => AllocationRecordKind::Allocation,
+            2 => AllocationRecordKind::Free,
+            _ => AllocationRecordKind::Allocation,
+        };
+        let mut addr_bytes = [0u8; 32];
+        addr_bytes.copy_from_slice(&buf[1..33]);
+        let mut count_bytes = [0u8; 4];
+        count_bytes.copy_from_slice(&buf[33..37]);
+        let mut ts = [0u8; 8];
+        ts.copy_from_slice(&buf[40..48]);
+
+        Self {
+            kind,
+            addr: BlockAddr::from_bytes(&addr_bytes),
+            count: u32::from_le_bytes(count_bytes),
+            timestamp: u64::from_le_bytes(ts),
+        }
+    }
+}
+
 /// Journal superblock
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -73,20 +121,22 @@ pub struct TxDescriptor {
     pub seq: u64,
     pub state: TxState,
     pub block_count: u32,
+    pub record_count: u32,
     pub timestamp: u64,
     pub checksum: u64,
 }
 
 impl TxDescriptor {
-    pub const SIZE: usize = 40;
+    pub const SIZE: usize = 48;
 
     pub fn serialize(&self, buf: &mut [u8]) {
         buf[0..8].copy_from_slice(&self.magic.to_le_bytes());
         buf[8..16].copy_from_slice(&self.seq.to_le_bytes());
         buf[16..20].copy_from_slice(&(self.state as u32).to_le_bytes());
         buf[20..24].copy_from_slice(&self.block_count.to_le_bytes());
-        buf[24..32].copy_from_slice(&self.timestamp.to_le_bytes());
-        buf[32..40].copy_from_slice(&self.checksum.to_le_bytes());
+        buf[24..28].copy_from_slice(&self.record_count.to_le_bytes());
+        buf[32..40].copy_from_slice(&self.timestamp.to_le_bytes());
+        buf[40..48].copy_from_slice(&self.checksum.to_le_bytes());
     }
 
     pub fn deserialize(buf: &[u8]) -> Self {
@@ -100,8 +150,9 @@ impl TxDescriptor {
                 _ => TxState::Invalid,
             },
             block_count: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
-            timestamp: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
-            checksum: u64::from_le_bytes(buf[32..40].try_into().unwrap()),
+            record_count: u32::from_le_bytes(buf[24..28].try_into().unwrap()),
+            timestamp: u64::from_le_bytes(buf[32..40].try_into().unwrap()),
+            checksum: u64::from_le_bytes(buf[40..48].try_into().unwrap()),
         }
     }
 }
@@ -139,18 +190,29 @@ pub enum JournalError {
     JournalFull,
     CorruptedEntry,
     ChecksumMismatch,
+    DescriptorOverflow,
     IoError(IoError),
 }
 
 impl From<IoError> for JournalError {
-    fn from(e: IoError) -> Self { JournalError::IoError(e) }
+    fn from(e: IoError) -> Self {
+        JournalError::IoError(e)
+    }
 }
 
 /// In-memory transaction builder
 pub struct Transaction {
     seq: u64,
-    blocks: Vec<(BlockAddr, [u8; BLOCK_SIZE])>,
+    blocks: Vec<TxBlock>,
+    records: Vec<AllocationRecord>,
     state: TxState,
+}
+
+#[derive(Clone)]
+struct TxBlock {
+    addr: BlockAddr,
+    data: [u8; BLOCK_SIZE],
+    is_bitmap: bool,
 }
 
 impl Transaction {
@@ -158,6 +220,7 @@ impl Transaction {
         Self {
             seq,
             blocks: Vec::with_capacity(MAX_TRANSACTION_BLOCKS),
+            records: Vec::new(),
             state: TxState::Running,
         }
     }
@@ -169,12 +232,63 @@ impl Transaction {
         if self.state != TxState::Running {
             return Err(JournalError::InvalidState);
         }
-        self.blocks.push((addr, *data));
+        self.blocks.push(TxBlock {
+            addr,
+            data: *data,
+            is_bitmap: false,
+        });
         Ok(())
     }
 
-    pub fn block_count(&self) -> usize { self.blocks.len() }
-    pub fn sequence(&self) -> u64 { self.seq }
+    pub fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+    pub fn sequence(&self) -> u64 {
+        self.seq
+    }
+
+    pub fn write_bitmap(
+        &mut self,
+        addr: BlockAddr,
+        data: &[u8; BLOCK_SIZE],
+    ) -> Result<(), JournalError> {
+        if self.blocks.len() >= MAX_TRANSACTION_BLOCKS {
+            return Err(JournalError::TransactionFull);
+        }
+        self.blocks.push(TxBlock {
+            addr,
+            data: *data,
+            is_bitmap: true,
+        });
+        Ok(())
+    }
+
+    pub fn log_alloc(&mut self, addr: BlockAddr, count: u32) -> Result<(), JournalError> {
+        self.push_record(AllocationRecordKind::Allocation, addr, count)
+    }
+
+    pub fn log_free(&mut self, addr: BlockAddr, count: u32) -> Result<(), JournalError> {
+        self.push_record(AllocationRecordKind::Free, addr, count)
+    }
+
+    fn push_record(
+        &mut self,
+        kind: AllocationRecordKind,
+        addr: BlockAddr,
+        count: u32,
+    ) -> Result<(), JournalError> {
+        if self.records.len() >= (BLOCK_SIZE - TxDescriptor::SIZE) / AllocationRecord::SIZE {
+            return Err(JournalError::TransactionFull);
+        }
+
+        self.records.push(AllocationRecord {
+            kind,
+            addr,
+            count,
+            timestamp: crate::time::SystemClock::new().now_ns(),
+        });
+        Ok(())
+    }
 }
 
 /// Journal manager
@@ -201,7 +315,7 @@ impl<B: BlockDevice> Journal<B> {
     }
 
     pub fn commit(&self, tx: &mut Transaction) -> Result<(), JournalError> {
-        if tx.blocks.is_empty() {
+        if tx.blocks.is_empty() && tx.records.is_empty() {
             return Ok(());
         }
 
@@ -209,8 +323,13 @@ impl<B: BlockDevice> Journal<B> {
         let mut desc_buf = [0u8; BLOCK_SIZE];
 
         let mut checksum_data = Vec::new();
-        for (addr, _) in &tx.blocks {
-            checksum_data.extend_from_slice(&addr.to_bytes());
+        for block in &tx.blocks {
+            checksum_data.extend_from_slice(&block.addr.to_bytes());
+        }
+        for record in &tx.records {
+            let mut buf = [0u8; AllocationRecord::SIZE];
+            record.serialize(&mut buf);
+            checksum_data.extend_from_slice(&buf);
         }
         let desc_checksum = crate::checksum::crc32c(&checksum_data) as u64;
 
@@ -219,6 +338,7 @@ impl<B: BlockDevice> Journal<B> {
             seq: tx.seq,
             state: TxState::Running,
             block_count: tx.blocks.len() as u32,
+            record_count: tx.records.len() as u32,
             timestamp: crate::time::SystemClock::new().now_ns(),
             checksum: desc_checksum,
         };
@@ -227,17 +347,41 @@ impl<B: BlockDevice> Journal<B> {
 
         // Write block addresses after descriptor
         let mut offset = TxDescriptor::SIZE;
-        for (addr, _) in &tx.blocks {
-            desc_buf[offset..offset + 32].copy_from_slice(&addr.to_bytes());
+        for block in &tx.blocks {
+            desc_buf[offset..offset + 32].copy_from_slice(&block.addr.to_bytes());
             offset += 32;
+        }
+
+        if offset + 4 + tx.records.len() * AllocationRecord::SIZE > BLOCK_SIZE {
+            return Err(JournalError::DescriptorOverflow);
+        }
+
+        desc_buf[offset..offset + 4].copy_from_slice(&descriptor.record_count.to_le_bytes());
+        offset += 4;
+        let aligned = (offset + 7) & !7;
+        if aligned > BLOCK_SIZE {
+            return Err(JournalError::DescriptorOverflow);
+        }
+        offset = aligned;
+
+        for record in &tx.records {
+            let mut buf = [0u8; AllocationRecord::SIZE];
+            record.serialize(&mut buf);
+            desc_buf[offset..offset + AllocationRecord::SIZE].copy_from_slice(&buf);
+            offset += AllocationRecord::SIZE;
         }
 
         self.device.write_block(desc_addr, &desc_buf)?;
 
         // Write data blocks
-        for (i, (_, data)) in tx.blocks.iter().enumerate() {
+        let contains_bitmap = tx.blocks.iter().any(|b| b.is_bitmap);
+        for (i, block) in tx.blocks.iter().enumerate() {
             let data_addr = self.journal_block_addr(tx.seq, 1 + i as u64);
-            self.device.write_block(data_addr, data)?;
+            self.device.write_block(data_addr, &block.data)?;
+        }
+
+        if contains_bitmap {
+            self.device.sync()?;
         }
 
         // Write commit record
@@ -245,8 +389,13 @@ impl<B: BlockDevice> Journal<B> {
         let mut commit_buf = [0u8; BLOCK_SIZE];
 
         let mut all_data = Vec::new();
-        for (_, data) in &tx.blocks {
-            all_data.extend_from_slice(data);
+        for block in &tx.blocks {
+            all_data.extend_from_slice(&block.data);
+        }
+        for record in &tx.records {
+            let mut buf = [0u8; AllocationRecord::SIZE];
+            record.serialize(&mut buf);
+            all_data.extend_from_slice(&buf);
         }
         let commit_checksum = crate::checksum::crc32c(&all_data) as u64;
 
@@ -270,8 +419,8 @@ impl<B: BlockDevice> Journal<B> {
             return Err(JournalError::InvalidState);
         }
 
-        for (dest_addr, data) in &tx.blocks {
-            self.device.write_block(*dest_addr, data)?;
+        for block in &tx.blocks {
+            self.device.write_block(block.addr, &block.data)?;
         }
 
         self.device.sync()?;
@@ -334,8 +483,8 @@ impl<B: BlockDevice> Journal<B> {
     }
 
     fn journal_block_addr(&self, seq: u64, offset: u64) -> BlockAddr {
-        let journal_offset = ((seq * (MAX_TRANSACTION_BLOCKS as u64 + 2)) + offset) 
-            % self.header.block_count;
+        let journal_offset =
+            ((seq * (MAX_TRANSACTION_BLOCKS as u64 + 2)) + offset) % self.header.block_count;
         let mut addr = self.header.first_block;
         addr.limbs[0] += journal_offset;
         addr
