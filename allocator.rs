@@ -8,7 +8,11 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::journal::{AllocationRecordKind, Journal, JournalError};
-use crate::{AllocError, BlockAddr, BlockDevice, VolumeAllocator};
+use crate::panic_support::{
+    allocator_event_window, record_allocator_event, register_allocator_reporter, AllocatorEvent,
+    AllocatorEventKind, AllocatorPanicReport, AllocatorPanicReporter,
+};
+use crate::{AllocError, BlockAddr, BlockDevice, VolumeAllocator, BLOCKS_PER_SHARD};
 
 /// Tunables controlling cache sizing, trim batching, and queue admission.
 #[derive(Clone, Debug)]
@@ -139,6 +143,8 @@ pub struct CachedVolumeAllocator<B: BlockDevice> {
     config: AllocatorConfig,
     trim_state: Mutex<TrimState>,
     metrics: AllocatorMetrics,
+    clock: crate::time::SystemClock,
+    pressure_threshold: u64,
 }
 
 impl<B: BlockDevice> CachedVolumeAllocator<B> {
@@ -167,6 +173,8 @@ impl<B: BlockDevice> CachedVolumeAllocator<B> {
             config,
             trim_state: Mutex::new(TrimState::new()),
             metrics: AllocatorMetrics::default(),
+            clock: crate::time::SystemClock::new(),
+            pressure_threshold: BLOCKS_PER_SHARD / 8,
         }
     }
 
@@ -196,16 +204,36 @@ impl<B: BlockDevice> CachedVolumeAllocator<B> {
         self.inflight.fetch_sub(1, Ordering::AcqRel);
     }
 
+    fn log_event(&self, kind: AllocatorEventKind, shard: Option<u16>, detail: u64) {
+        record_allocator_event(AllocatorEvent {
+            ts_ns: self.clock.now_ns(),
+            shard_id: shard,
+            detail,
+            kind,
+        });
+    }
+
+    fn error_code(err: &AllocError) -> u64 {
+        match err {
+            AllocError::NoSpace => 1,
+            AllocError::DoubleFree => 2,
+            AllocError::OutOfBounds => 3,
+            AllocError::InvalidShard => 4,
+            AllocError::WrongVolume => 5,
+            AllocError::NetworkError => 6,
+            AllocError::RemoteNodeDown => 7,
+        }
+    }
+
     pub fn alloc_block(&self) -> Result<BlockAddr, AllocError> {
         self.admit();
-        let clock = crate::time::SystemClock::new();
-        let start = clock.now_ns();
+        let start = self.clock.now_ns();
         let cache_idx = self.cache_index();
         let mut cache = self.caches[cache_idx].lock().unwrap();
 
         if let Some(addr) = cache.pop() {
             self.finish();
-            self.metrics.record_alloc(clock.now_ns() - start);
+            self.metrics.record_alloc(self.clock.now_ns() - start);
             self.record_allocation(addr, 1);
             return Ok(addr);
         }
@@ -217,24 +245,42 @@ impl<B: BlockDevice> CachedVolumeAllocator<B> {
         });
 
         self.finish();
-        self.metrics.record_alloc(clock.now_ns() - start);
+        let latency = self.clock.now_ns().saturating_sub(start);
+        self.metrics.record_alloc(latency);
+        if let Err(err) = &result {
+            self.log_event(
+                AllocatorEventKind::AllocationFailed,
+                None,
+                Self::error_code(err),
+            );
+        }
         result
     }
 
     pub fn free_block(&self, addr: BlockAddr) -> Result<(), AllocError> {
         self.admit();
-        let clock = crate::time::SystemClock::new();
-        let start = clock.now_ns();
+        let start = self.clock.now_ns();
         let cache_idx = self.cache_index();
         {
             let mut cache = self.caches[cache_idx].lock().unwrap();
             if let Some(evicted) = cache.push(addr, self.config.cache_capacity) {
-                self.volume.free_block(evicted)?;
+                if let Err(err) = self.volume.free_block(evicted) {
+                    self.finish();
+                    self.metrics
+                        .record_free(self.clock.now_ns().saturating_sub(start));
+                    self.log_event(
+                        AllocatorEventKind::FreeFailed,
+                        Some(evicted.shard_id()),
+                        evicted.block_offset(),
+                    );
+                    return Err(err);
+                }
                 self.enqueue_trim(evicted);
             }
         }
         self.finish();
-        self.metrics.record_free(clock.now_ns() - start);
+        self.metrics
+            .record_free(self.clock.now_ns().saturating_sub(start));
         self.record_free(addr, 1);
         Ok(())
     }
@@ -326,6 +372,12 @@ impl<B: BlockDevice> CachedVolumeAllocator<B> {
         }
     }
 
+    /// Leak and register this allocator as the panic reporter.
+    pub fn register_for_panic(self: &Arc<Self>) {
+        let leaked: &'static Self = Arc::leak(self.clone());
+        register_allocator_reporter(Some(leaked));
+    }
+
     fn emit_record(
         journal: &Arc<Journal<B>>,
         kind: AllocationRecordKind,
@@ -338,6 +390,24 @@ impl<B: BlockDevice> CachedVolumeAllocator<B> {
             AllocationRecordKind::Free => tx.log_free(addr, count)?,
         }
         journal.commit(&mut tx)
+    }
+}
+
+impl<B: BlockDevice> AllocatorPanicReporter for CachedVolumeAllocator<B> {
+    fn allocator_panic_report(&self) -> AllocatorPanicReport {
+        let snapshot = self.volume.panic_snapshot(self.pressure_threshold);
+        let (events, head, recorded) = allocator_event_window();
+
+        AllocatorPanicReport {
+            epoch: snapshot.epoch,
+            shards_total: snapshot.shards_total,
+            shards_with_pressure: snapshot.shards_with_pressure,
+            free_blocks: snapshot.free_blocks,
+            last_errors: events,
+            events_head: head,
+            events_recorded: recorded,
+            double_free_guard_hits: snapshot.double_free_guard_hits,
+        }
     }
 }
 
@@ -370,6 +440,8 @@ mod tests {
             volume_id: volume,
             shards,
             current_shard: AtomicU32::new(0),
+            counters: AllocatorErrorCounters::default(),
+            epoch: AtomicU64::new(0),
         }
     }
 

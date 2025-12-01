@@ -10,8 +10,11 @@
 use std::io::{ErrorKind, Result as IoResult};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use crate::panic_support::{register_panic_quiesce, PanicQuiesce, PanicQuiesceResult};
 use crate::{BlockAddr, BlockDevice, FsResult, IoError, BLOCK_SIZE};
 
 /// Hook signature used to validate buffers before/after I/O.
@@ -118,6 +121,8 @@ pub struct OsBlockDevice<B: BlockBackend = std::fs::File> {
     backend: B,
     params: BlockDeviceParams,
     retries: usize,
+    panic_frozen: AtomicBool,
+    in_flight: AtomicUsize,
 }
 
 impl OsBlockDevice {
@@ -138,7 +143,15 @@ impl<B: BlockBackend> OsBlockDevice<B> {
             backend,
             params,
             retries: 3,
+            panic_frozen: AtomicBool::new(false),
+            in_flight: AtomicUsize::new(0),
         }
+    }
+
+    /// Leak the device reference and register it for panic quiesce handling.
+    pub fn register_for_panic(self: &Arc<Self>) {
+        let leaked: &'static Self = Arc::leak(self.clone());
+        register_panic_quiesce(Some(leaked));
     }
 
     fn validate_address(&self, addr: BlockAddr) -> FsResult<u64> {
@@ -160,18 +173,30 @@ impl<B: BlockBackend> OsBlockDevice<B> {
     where
         F: FnMut() -> IoResult<()>,
     {
+        if self.panic_frozen.load(Ordering::Acquire) {
+            return Err(IoError::IoFailed);
+        }
+
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
         let attempts = self.retries.max(1);
         for attempt in 0..attempts {
             match op() {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                    return Ok(());
+                }
                 Err(err) if attempt + 1 < attempts => {
                     if err.kind() == ErrorKind::Interrupted {
                         continue;
                     }
                 }
-                Err(err) => return Err(map_io_error(err)),
+                Err(err) => {
+                    self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                    return Err(map_io_error(err));
+                }
             }
         }
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
         Err(IoError::IoFailed)
     }
 
@@ -217,11 +242,18 @@ impl<B: BlockBackend> BlockDevice for OsBlockDevice<B> {
     }
 
     fn sync(&self) -> FsResult<()> {
-        match self.backend.flush() {
+        if self.panic_frozen.load(Ordering::Acquire) {
+            return Err(IoError::IoFailed);
+        }
+
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        let result = match self.backend.flush() {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == ErrorKind::Unsupported => Ok(()),
             Err(err) => Err(map_io_error(err)),
-        }
+        };
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        result
     }
 
     fn trim(&self, addr: BlockAddr) -> FsResult<()> {
@@ -231,17 +263,57 @@ impl<B: BlockBackend> BlockDevice for OsBlockDevice<B> {
     fn trim_range(&self, addr: BlockAddr, len: u64) -> FsResult<()> {
         let offset = self.validate_address(addr)?;
         let byte_len = len.saturating_mul(BLOCK_SIZE as u64);
-        match self.backend.trim(offset, byte_len) {
+        if self.panic_frozen.load(Ordering::Acquire) {
+            return Err(IoError::IoFailed);
+        }
+
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        let result = match self.backend.trim(offset, byte_len) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == ErrorKind::Unsupported => self
                 .zero_range(offset, len)
                 .or_else(|_| self.zero_block(offset)),
             Err(err) => Err(map_io_error(err)),
-        }
+        };
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        result
     }
 
     fn queue_depth(&self) -> usize {
         self.params.queue_depth
+    }
+}
+
+impl<B: BlockBackend> PanicQuiesce for OsBlockDevice<B> {
+    fn panic_freeze(&self) -> PanicQuiesceResult {
+        self.panic_frozen.store(true, Ordering::Release);
+        let start = Instant::now();
+        let mut drained = false;
+        let mut flush_issued = false;
+        let timeout = Duration::from_millis(50);
+
+        loop {
+            let in_flight = self.in_flight.load(Ordering::Acquire);
+            if in_flight == 0 {
+                drained = true;
+                flush_issued = self.backend.flush().is_ok();
+                return PanicQuiesceResult {
+                    drained,
+                    in_flight,
+                    flush_issued,
+                };
+            }
+
+            if start.elapsed() >= timeout {
+                return PanicQuiesceResult {
+                    drained,
+                    in_flight,
+                    flush_issued,
+                };
+            }
+
+            std::thread::yield_now();
+        }
     }
 }
 
