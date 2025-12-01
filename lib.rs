@@ -13,6 +13,7 @@ use alloc::{boxed::Box, string::String, vec::Vec};
 #[cfg(feature = "std")]
 use std::{boxed::Box, string::String, vec::Vec};
 
+use crate::panic_support::{record_allocator_event, AllocatorEvent, AllocatorEventKind};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 #[cfg(feature = "std")]
@@ -50,6 +51,7 @@ pub mod journal;
 pub mod mkfs;
 pub mod ops;
 pub mod os_porting;
+pub mod panic_support;
 pub mod time;
 pub mod write;
 
@@ -500,6 +502,15 @@ pub struct AllocatorCounterSnapshot {
     pub double_free: u64,
 }
 
+/// Snapshot of allocator state suitable for panic breadcrumbs.
+pub struct VolumePanicSnapshot {
+    pub epoch: u64,
+    pub shards_total: u32,
+    pub shards_with_pressure: u32,
+    pub free_blocks: u64,
+    pub double_free_guard_hits: u64,
+}
+
 impl AllocatorErrorCounters {
     fn snapshot(&self) -> AllocatorCounterSnapshot {
         AllocatorCounterSnapshot {
@@ -519,6 +530,7 @@ pub struct VolumeAllocator {
     /// Current shard for round-robin allocation
     current_shard: AtomicU32,
     counters: AllocatorErrorCounters,
+    epoch: AtomicU64,
 }
 
 impl VolumeAllocator {
@@ -529,6 +541,7 @@ impl VolumeAllocator {
             shards: core::array::from_fn(|_| None),
             current_shard: AtomicU32::new(0),
             counters: AllocatorErrorCounters::default(),
+            epoch: AtomicU64::new(0),
         }
     }
 
@@ -562,6 +575,7 @@ impl VolumeAllocator {
 
             if let Some(ref shard) = self.shards[shard_id as usize] {
                 if let Some(offset) = shard.alloc() {
+                    self.epoch.fetch_add(1, Ordering::Relaxed);
                     return Ok(BlockAddr::new(
                         self.node_id,
                         self.volume_id,
@@ -572,6 +586,13 @@ impl VolumeAllocator {
             }
         }
 
+        record_allocator_event(AllocatorEvent {
+            ts_ns: crate::time::SystemClock::new().now_ns(),
+            shard_id: None,
+            detail: 0,
+            kind: AllocatorEventKind::Pressure,
+        });
+
         Err(AllocError::NoSpace)
     }
 
@@ -579,7 +600,10 @@ impl VolumeAllocator {
     pub fn free_block(&self, addr: BlockAddr) -> Result<(), AllocError> {
         let (shard, offset) = self.resolve_shard_for_addr(addr)?;
         match shard.free(offset) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.epoch.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
             Err(AllocError::DoubleFree) => {
                 self.counters.double_free.fetch_add(1, Ordering::Relaxed);
                 log_error!(
@@ -589,6 +613,12 @@ impl VolumeAllocator {
                     shard.shard_id(),
                     offset
                 );
+                record_allocator_event(AllocatorEvent {
+                    ts_ns: crate::time::SystemClock::new().now_ns(),
+                    shard_id: Some(shard.shard_id()),
+                    detail: offset,
+                    kind: AllocatorEventKind::DoubleFree,
+                });
                 Err(AllocError::DoubleFree)
             }
             Err(err) => Err(err),
@@ -601,6 +631,29 @@ impl VolumeAllocator {
             .filter_map(|s| s.as_ref())
             .map(|s| s.free_blocks())
             .sum()
+    }
+
+    pub fn panic_snapshot(&self, pressure_threshold: u64) -> VolumePanicSnapshot {
+        let mut shards_total = 0u32;
+        let mut shards_with_pressure = 0u32;
+        let mut free_blocks = 0u64;
+
+        for shard in self.shards.iter().filter_map(|s| s.as_ref()) {
+            shards_total += 1;
+            let free = shard.free_blocks();
+            free_blocks = free_blocks.saturating_add(free);
+            if free <= pressure_threshold {
+                shards_with_pressure = shards_with_pressure.saturating_add(1);
+            }
+        }
+
+        VolumePanicSnapshot {
+            epoch: self.epoch.load(Ordering::Relaxed),
+            shards_total,
+            shards_with_pressure,
+            free_blocks,
+            double_free_guard_hits: self.counters.double_free.load(Ordering::Relaxed),
+        }
     }
 
     fn resolve_shard_for_addr(
@@ -618,6 +671,12 @@ impl VolumeAllocator {
                 addr.node_id(),
                 addr.volume_id()
             );
+            record_allocator_event(AllocatorEvent {
+                ts_ns: crate::time::SystemClock::new().now_ns(),
+                shard_id: Some(addr.shard_id()),
+                detail: addr.block_offset(),
+                kind: AllocatorEventKind::FreeFailed,
+            });
             return Err(AllocError::WrongVolume);
         }
 
@@ -635,6 +694,12 @@ impl VolumeAllocator {
                 addr.shard_id(),
                 addr.block_offset()
             );
+                record_allocator_event(AllocatorEvent {
+                    ts_ns: crate::time::SystemClock::new().now_ns(),
+                    shard_id: Some(addr.shard_id()),
+                    detail: addr.block_offset(),
+                    kind: AllocatorEventKind::FreeFailed,
+                });
                 AllocError::InvalidShard
             })?;
 
@@ -649,10 +714,27 @@ impl VolumeAllocator {
                 offset,
                 shard.capacity()
             );
+            record_allocator_event(AllocatorEvent {
+                ts_ns: crate::time::SystemClock::new().now_ns(),
+                shard_id: Some(shard.shard_id()),
+                detail: offset,
+                kind: AllocatorEventKind::FreeFailed,
+            });
             return Err(AllocError::OutOfBounds);
         }
 
         Ok((shard, offset))
+    }
+
+    /// Retrieve free space per shard for diagnostics.
+    pub fn shard_free_blocks(&self) -> alloc::vec::Vec<(u16, u64)> {
+        let mut free = alloc::vec::Vec::with_capacity(SHARDS_PER_VOLUME as usize);
+        for (idx, shard) in self.shards.iter().enumerate() {
+            if let Some(shard) = shard {
+                free.push((idx as u16, shard.free_blocks()));
+            }
+        }
+        free
     }
 }
 
@@ -728,18 +810,8 @@ mod allocator_tests {
             .unwrap()
             .error_counters();
         assert_eq!(counters.double_free, 1);
-    /// Retrieve free space per shard for diagnostics.
-    pub fn shard_free_blocks(&self) -> alloc::vec::Vec<(u16, u64)> {
-        let mut free = alloc::vec::Vec::with_capacity(SHARDS_PER_VOLUME as usize);
-        for (idx, shard) in self.shards.iter().enumerate() {
-            if let Some(shard) = shard {
-                free.push((idx as u16, shard.free_blocks()));
-            }
-        }
-        free
     }
 }
-
 // ============================================================================
 // BLOCK I/O TRAITS
 // ============================================================================

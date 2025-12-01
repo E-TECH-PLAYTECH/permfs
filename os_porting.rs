@@ -9,6 +9,9 @@ use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicPtr, AtomicU8};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(not(feature = "std"))]
+use crate::panic_support::{allocator_panic_report, try_panic_quiesce, AllocatorPanicReport};
+
 /// Panic strategy to follow after logging the panic details.
 #[cfg(not(feature = "std"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,13 +87,74 @@ fn with_logger<F: FnOnce(fn(&str))>(f: F) {
 fn panic_buffer(info: &core::panic::PanicInfo<'_>) -> PanicLineBuffer {
     let mut buf = PanicLineBuffer::new();
     let _ = write!(buf, "PermFS panic: {info}");
+
+    if let Some(ts) = monotonic_now_ns() {
+        let _ = write!(buf, " ts_ns={ts}");
+    }
+
+    if let Some(result) = try_panic_quiesce() {
+        let _ = write!(
+            buf,
+            " quiesce drained={} inflight={} flushed={}",
+            result.drained, result.in_flight, result.flush_issued,
+        );
+    }
+
+    append_allocator_report(&mut buf, allocator_panic_report());
     buf
+}
+
+#[cfg(not(feature = "std"))]
+fn append_allocator_report(buf: &mut PanicLineBuffer, report: AllocatorPanicReport) {
+    let _ = write!(
+        buf,
+        " allocator epoch={} shards_total={} pressure={} free_blocks={} double_free_guards={}",
+        report.epoch,
+        report.shards_total,
+        report.shards_with_pressure,
+        report.free_blocks,
+        report.double_free_guard_hits,
+    );
+
+    let mut printed = 0usize;
+    let total_events = report.events_recorded.min(report.last_errors.len());
+
+    // Walk the ring starting from the newest entry.
+    if total_events > 0 {
+        let _ = write!(buf, " allocator_events=");
+        let mut idx = report
+            .events_head
+            .wrapping_add(report.last_errors.len())
+            .wrapping_sub(1)
+            % report.last_errors.len();
+
+        while printed < total_events && printed < 6 {
+            let event = report.last_errors[idx];
+            let _ = write!(buf, "[kind={:?} shard=", event.kind);
+            match event.shard_id {
+                Some(id) => {
+                    let _ = write!(buf, "{}", id);
+                }
+                None => {
+                    let _ = write!(buf, "-");
+                }
+            }
+            let _ = write!(buf, " detail={} ts={}]", event.detail, event.ts_ns);
+
+            printed += 1;
+            if idx == 0 {
+                idx = report.last_errors.len() - 1;
+            } else {
+                idx -= 1;
+            }
+        }
+    }
 }
 
 /// Fixed-size stack buffer that implements `fmt::Write` without heap allocation.
 #[cfg(not(feature = "std"))]
 struct PanicLineBuffer {
-    buf: [u8; 384],
+    buf: [u8; 1024],
     len: usize,
 }
 
@@ -98,7 +162,7 @@ struct PanicLineBuffer {
 impl PanicLineBuffer {
     const fn new() -> Self {
         Self {
-            buf: [0; 384],
+            buf: [0; 1024],
             len: 0,
         }
     }
