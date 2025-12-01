@@ -15,7 +15,7 @@ path = "lib.rs"
 
 [features]
 default = ["std"]
-std = ["bitflags/std", "alloc"]
+std = ["bitflags/std", "alloc", "log/std"]
 alloc = []
 kernel = []
 os_porting = ["alloc"]
@@ -25,6 +25,7 @@ block-discard = ["std"]
 
 [dependencies]
 bitflags = { version = "2.4", default-features = false }
+log = { version = "0.4", optional = true }
 
 # Optional std dependencies
 fuser = { version = "0.14", optional = true }

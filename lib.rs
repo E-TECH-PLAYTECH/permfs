@@ -15,6 +15,22 @@ use std::{boxed::Box, string::String, vec::Vec};
 
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+#[cfg(feature = "std")]
+use log::error;
+
+#[cfg(not(feature = "std"))]
+macro_rules! log_error {
+    ($($arg:tt)*) => {
+        let _ = ($($arg)*);
+    };
+}
+
+#[cfg(feature = "std")]
+macro_rules! log_error {
+    ($($arg:tt)*) => {
+        error!($($arg)*);
+    };
+}
 
 // ============================================================================
 // MODULE DECLARATIONS
@@ -23,6 +39,10 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 pub mod checksum;
 pub mod dir;
 pub mod dlm;
+pub mod dlm;
+#[cfg(feature = "std")]
+pub mod drivers;
+pub mod extent;
 pub mod extent;
 pub mod journal;
 pub mod mkfs;
@@ -30,10 +50,6 @@ pub mod ops;
 pub mod os_porting;
 pub mod time;
 pub mod write;
-pub mod extent;
-pub mod dlm;
-#[cfg(feature = "std")]
-pub mod drivers;
 
 #[cfg(feature = "fuse")]
 pub mod fuse;
@@ -46,10 +62,10 @@ pub mod vfs;
 
 // Re-exports
 pub use checksum::{compute_inode_checksum, compute_superblock_checksum, crc32c, verify_checksum};
-pub use time::Clock;
-pub use checksum::{crc32c, verify_checksum, compute_inode_checksum, compute_superblock_checksum};
+pub use checksum::{compute_inode_checksum, compute_superblock_checksum, crc32c, verify_checksum};
 #[cfg(feature = "std")]
 pub use drivers::block_device::{BlockDeviceParams, ChecksumHook, OsBlockDevice};
+pub use time::Clock;
 
 // ============================================================================
 // 256-BIT BLOCK ADDRESSING
@@ -325,6 +341,8 @@ pub type FsResult<T> = Result<T, IoError>;
 /// Per-shard allocation state — lock-free local allocation
 pub struct ShardAllocator {
     shard_id: u16,
+    capacity_blocks: u64,
+    bitmap_owner: Box<[AtomicU64]>,
     /// Bitmap: 1 bit per block, 1M blocks = 128 KiB bitmap
     bitmap: NonNull<AtomicU64>,
     bitmap_words: usize,
@@ -341,6 +359,46 @@ unsafe impl Send for ShardAllocator {}
 unsafe impl Sync for ShardAllocator {}
 
 impl ShardAllocator {
+    /// Create a new shard allocator with a bounded capacity (capped to BLOCKS_PER_SHARD)
+    pub fn new(shard_id: u16, total_blocks: u64) -> Self {
+        let capacity = total_blocks.min(BLOCKS_PER_SHARD);
+        let bitmap_words = ((capacity + 63) / 64) as usize;
+        let mut bitmap: Vec<AtomicU64> = (0..bitmap_words).map(|_| AtomicU64::new(0)).collect();
+
+        // Mask out bits beyond capacity to prevent accidental allocations
+        if capacity % 64 != 0 {
+            let valid_bits = capacity % 64;
+            let mask = !((1u64 << valid_bits) - 1);
+            if let Some(last) = bitmap.last_mut() {
+                last.store(mask, Ordering::Relaxed);
+            }
+        }
+
+        let bitmap_owner: Box<[AtomicU64]> = bitmap.into_boxed_slice();
+        let bitmap_ptr = NonNull::new(bitmap_owner.as_ptr() as *mut AtomicU64)
+            .expect("bitmap pointer must not be null");
+
+        Self {
+            shard_id,
+            capacity_blocks: capacity,
+            bitmap_owner,
+            // Bitmap pointer is kept for fast indexing
+            bitmap: bitmap_ptr,
+            bitmap_words,
+            next_hint: AtomicU64::new(0),
+            free_count: AtomicU64::new(capacity),
+            generation: AtomicU32::new(0),
+        }
+    }
+
+    pub fn shard_id(&self) -> u16 {
+        self.shard_id
+    }
+
+    pub fn capacity(&self) -> u64 {
+        self.capacity_blocks
+    }
+
     /// Allocate a block from this shard — lock-free
     pub fn alloc(&self) -> Option<u64> {
         let hint = self.next_hint.load(Ordering::Relaxed) as usize;
@@ -381,22 +439,35 @@ impl ShardAllocator {
 
     /// Free a block — lock-free
     pub fn free(&self, block_offset: u64) -> Result<(), AllocError> {
+        self.validate_offset(block_offset)?;
         let word_idx = (block_offset / 64) as usize;
         let bit = block_offset % 64;
         let mask = 1u64 << bit;
+        let word = unsafe { &*self.bitmap.as_ptr().add(word_idx) };
 
+        match word.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+            if current & mask == 0 {
+                None
+            } else {
+                Some(current & !mask)
+            }
+        }) {
+            Ok(_) => {
+                self.free_count.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(_) => Err(AllocError::DoubleFree),
+        }
+    }
+
+    fn validate_offset(&self, block_offset: u64) -> Result<(), AllocError> {
+        if block_offset >= self.capacity_blocks {
+            return Err(AllocError::OutOfBounds);
+        }
+        let word_idx = (block_offset / 64) as usize;
         if word_idx >= self.bitmap_words {
             return Err(AllocError::OutOfBounds);
         }
-
-        let word = unsafe { &*self.bitmap.as_ptr().add(word_idx) };
-        let prev = word.fetch_and(!mask, Ordering::AcqRel);
-
-        if prev & mask == 0 {
-            return Err(AllocError::DoubleFree);
-        }
-
-        self.free_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -409,6 +480,32 @@ impl ShardAllocator {
 // VOLUME ALLOCATOR
 // ============================================================================
 
+#[derive(Default)]
+pub struct AllocatorErrorCounters {
+    wrong_volume: AtomicU64,
+    invalid_shard: AtomicU64,
+    out_of_bounds: AtomicU64,
+    double_free: AtomicU64,
+}
+
+pub struct AllocatorCounterSnapshot {
+    pub wrong_volume: u64,
+    pub invalid_shard: u64,
+    pub out_of_bounds: u64,
+    pub double_free: u64,
+}
+
+impl AllocatorErrorCounters {
+    fn snapshot(&self) -> AllocatorCounterSnapshot {
+        AllocatorCounterSnapshot {
+            wrong_volume: self.wrong_volume.load(Ordering::Relaxed),
+            invalid_shard: self.invalid_shard.load(Ordering::Relaxed),
+            out_of_bounds: self.out_of_bounds.load(Ordering::Relaxed),
+            double_free: self.double_free.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Volume-level allocator: manages multiple shards
 pub struct VolumeAllocator {
     node_id: u64,
@@ -416,9 +513,40 @@ pub struct VolumeAllocator {
     shards: [Option<Box<ShardAllocator>>; SHARDS_PER_VOLUME as usize],
     /// Current shard for round-robin allocation
     current_shard: AtomicU32,
+    counters: AllocatorErrorCounters,
 }
 
 impl VolumeAllocator {
+    pub fn new(node_id: u64, volume_id: u32) -> Self {
+        Self {
+            node_id,
+            volume_id,
+            shards: core::array::from_fn(|_| None),
+            current_shard: AtomicU32::new(0),
+            counters: AllocatorErrorCounters::default(),
+        }
+    }
+
+    pub fn add_shard(&mut self, shard: ShardAllocator) -> Result<(), AllocError> {
+        let idx = shard.shard_id() as usize;
+        if idx >= SHARDS_PER_VOLUME as usize {
+            log_error!(
+                "allocator_configuration_error error=invalid_shard_index node={} volume={} shard={}",
+                self.node_id,
+                self.volume_id,
+                shard.shard_id()
+            );
+            return Err(AllocError::InvalidShard);
+        }
+
+        self.shards[idx] = Some(Box::new(shard));
+        Ok(())
+    }
+
+    pub fn error_counters(&self) -> AllocatorCounterSnapshot {
+        self.counters.snapshot()
+    }
+
     /// Allocate a block, trying local shards first
     pub fn alloc_block(&self) -> Result<BlockAddr, AllocError> {
         let start_shard = self.current_shard.fetch_add(1, Ordering::Relaxed) as u16;
@@ -444,14 +572,21 @@ impl VolumeAllocator {
 
     /// Free a block
     pub fn free_block(&self, addr: BlockAddr) -> Result<(), AllocError> {
-        if addr.node_id() != self.node_id || addr.volume_id() != self.volume_id {
-            return Err(AllocError::WrongVolume);
-        }
-
-        let shard_id = addr.shard_id() as usize;
-        match &self.shards[shard_id] {
-            Some(shard) => shard.free(addr.block_offset()),
-            None => Err(AllocError::InvalidShard),
+        let (shard, offset) = self.resolve_shard_for_addr(addr)?;
+        match shard.free(offset) {
+            Ok(()) => Ok(()),
+            Err(AllocError::DoubleFree) => {
+                self.counters.double_free.fetch_add(1, Ordering::Relaxed);
+                log_error!(
+                    "allocator_free_failure error=double_free node={} volume={} shard={} offset={}",
+                    self.node_id,
+                    self.volume_id,
+                    shard.shard_id(),
+                    offset
+                );
+                Err(AllocError::DoubleFree)
+            }
+            Err(err) => Err(err),
         }
     }
 
@@ -461,6 +596,133 @@ impl VolumeAllocator {
             .filter_map(|s| s.as_ref())
             .map(|s| s.free_blocks())
             .sum()
+    }
+
+    fn resolve_shard_for_addr(
+        &self,
+        addr: BlockAddr,
+    ) -> Result<(&ShardAllocator, u64), AllocError> {
+        if addr.node_id() != self.node_id || addr.volume_id() != self.volume_id {
+            self.counters.wrong_volume.fetch_add(1, Ordering::Relaxed);
+            log_error!(
+                "allocator_free_failure error=wrong_volume node={} volume={} shard={} offset={} addr_node={} addr_volume={}",
+                self.node_id,
+                self.volume_id,
+                addr.shard_id(),
+                addr.block_offset(),
+                addr.node_id(),
+                addr.volume_id()
+            );
+            return Err(AllocError::WrongVolume);
+        }
+
+        let shard_idx = addr.shard_id() as usize;
+        let shard = self
+            .shards
+            .get(shard_idx)
+            .and_then(|s| s.as_ref())
+            .ok_or_else(|| {
+                self.counters.invalid_shard.fetch_add(1, Ordering::Relaxed);
+                log_error!(
+                "allocator_free_failure error=invalid_shard node={} volume={} shard={} offset={}",
+                self.node_id,
+                self.volume_id,
+                addr.shard_id(),
+                addr.block_offset()
+            );
+                AllocError::InvalidShard
+            })?;
+
+        let offset = addr.block_offset();
+        if offset >= shard.capacity() {
+            self.counters.out_of_bounds.fetch_add(1, Ordering::Relaxed);
+            log_error!(
+                "allocator_free_failure error=out_of_bounds node={} volume={} shard={} offset={} capacity={}",
+                self.node_id,
+                self.volume_id,
+                shard.shard_id(),
+                offset,
+                shard.capacity()
+            );
+            return Err(AllocError::OutOfBounds);
+        }
+
+        Ok((shard, offset))
+    }
+}
+
+#[cfg(test)]
+mod allocator_tests {
+    use super::*;
+    use crate::mock::{MemoryBlockDevice, NullTransport};
+
+    fn build_fs_with_volume() -> (
+        PermFs<MemoryBlockDevice, NullTransport>,
+        BlockAddr,
+        u64,
+        u32,
+    ) {
+        let node_id = 1u64;
+        let volume_id = 0u32;
+        let device = MemoryBlockDevice::new(node_id, volume_id);
+        let transport = NullTransport;
+        let mut volume = VolumeAllocator::new(node_id, volume_id);
+        volume
+            .add_shard(ShardAllocator::new(0, 128))
+            .expect("failed to attach test shard");
+        let allocated = volume
+            .alloc_block()
+            .expect("expected an allocatable block for testing");
+
+        let mut fs = PermFs::new(node_id, device, transport);
+        fs.volumes[volume_id as usize] = Some(Box::new(volume));
+
+        (fs, allocated, node_id, volume_id)
+    }
+
+    #[test]
+    fn detects_wrong_volume_free() {
+        let (mut fs, _, node_id, volume_id) = build_fs_with_volume();
+        let wrong_addr = BlockAddr::new(node_id, volume_id + 1, 0, 0);
+
+        let result = fs.free_block(wrong_addr);
+        assert_eq!(result.unwrap_err(), AllocError::WrongVolume);
+
+        let counters = fs.volumes[volume_id as usize]
+            .as_ref()
+            .unwrap()
+            .error_counters();
+        assert_eq!(counters.wrong_volume, 1);
+    }
+
+    #[test]
+    fn detects_wrong_shard_free() {
+        let (mut fs, _, node_id, volume_id) = build_fs_with_volume();
+        let wrong_shard_addr = BlockAddr::new(node_id, volume_id, 5, 0);
+
+        let result = fs.free_block(wrong_shard_addr);
+        assert_eq!(result.unwrap_err(), AllocError::InvalidShard);
+
+        let counters = fs.volumes[volume_id as usize]
+            .as_ref()
+            .unwrap()
+            .error_counters();
+        assert_eq!(counters.invalid_shard, 1);
+    }
+
+    #[test]
+    fn detects_double_free_before_bitmap_mutation() {
+        let (mut fs, addr, _node_id, volume_id) = build_fs_with_volume();
+
+        fs.free_block(addr).expect("first free should succeed");
+        let result = fs.free_block(addr);
+        assert_eq!(result.unwrap_err(), AllocError::DoubleFree);
+
+        let counters = fs.volumes[volume_id as usize]
+            .as_ref()
+            .unwrap()
+            .error_counters();
+        assert_eq!(counters.double_free, 1);
     }
 }
 
