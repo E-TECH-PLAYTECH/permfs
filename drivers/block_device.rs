@@ -190,8 +190,16 @@ impl<B: BlockBackend> OsBlockDevice<B> {
     }
 
     fn zero_block(&self, byte_offset: u64) -> FsResult<()> {
+        self.zero_range(byte_offset, 1)
+    }
+
+    fn zero_range(&self, byte_offset: u64, blocks: u64) -> FsResult<()> {
         let zeros = [0u8; BLOCK_SIZE];
-        self.retry_io(|| self.backend.write_aligned(byte_offset, &zeros))
+        for blk in 0..blocks {
+            let offset = byte_offset.saturating_add(blk * BLOCK_SIZE as u64);
+            self.retry_io(|| self.backend.write_aligned(offset, &zeros))?;
+        }
+        Ok(())
     }
 }
 
@@ -217,12 +225,23 @@ impl<B: BlockBackend> BlockDevice for OsBlockDevice<B> {
     }
 
     fn trim(&self, addr: BlockAddr) -> FsResult<()> {
+        self.trim_range(addr, 1)
+    }
+
+    fn trim_range(&self, addr: BlockAddr, len: u64) -> FsResult<()> {
         let offset = self.validate_address(addr)?;
-        match self.backend.trim(offset, BLOCK_SIZE as u64) {
+        let byte_len = len.saturating_mul(BLOCK_SIZE as u64);
+        match self.backend.trim(offset, byte_len) {
             Ok(()) => Ok(()),
-            Err(err) if err.kind() == ErrorKind::Unsupported => self.zero_block(offset),
+            Err(err) if err.kind() == ErrorKind::Unsupported => self
+                .zero_range(offset, len)
+                .or_else(|_| self.zero_block(offset)),
             Err(err) => Err(map_io_error(err)),
         }
+    }
+
+    fn queue_depth(&self) -> usize {
+        self.params.queue_depth
     }
 }
 
