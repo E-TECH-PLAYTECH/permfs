@@ -20,9 +20,15 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 // MODULE DECLARATIONS
 // ============================================================================
 
+#[cfg(feature = "std")]
+pub mod allocator;
 pub mod checksum;
 pub mod dir;
 pub mod dlm;
+pub mod dlm;
+#[cfg(feature = "std")]
+pub mod drivers;
+pub mod extent;
 pub mod extent;
 pub mod journal;
 pub mod mkfs;
@@ -30,10 +36,6 @@ pub mod ops;
 pub mod os_porting;
 pub mod time;
 pub mod write;
-pub mod extent;
-pub mod dlm;
-#[cfg(feature = "std")]
-pub mod drivers;
 
 #[cfg(feature = "fuse")]
 pub mod fuse;
@@ -45,11 +47,13 @@ pub mod transport;
 pub mod vfs;
 
 // Re-exports
+#[cfg(feature = "std")]
+pub use allocator::{AllocatorConfig, AllocatorSnapshot, CachedVolumeAllocator};
 pub use checksum::{compute_inode_checksum, compute_superblock_checksum, crc32c, verify_checksum};
-pub use time::Clock;
-pub use checksum::{crc32c, verify_checksum, compute_inode_checksum, compute_superblock_checksum};
+pub use checksum::{compute_inode_checksum, compute_superblock_checksum, crc32c, verify_checksum};
 #[cfg(feature = "std")]
 pub use drivers::block_device::{BlockDeviceParams, ChecksumHook, OsBlockDevice};
+pub use time::Clock;
 
 // ============================================================================
 // 256-BIT BLOCK ADDRESSING
@@ -462,6 +466,17 @@ impl VolumeAllocator {
             .map(|s| s.free_blocks())
             .sum()
     }
+
+    /// Retrieve free space per shard for diagnostics.
+    pub fn shard_free_blocks(&self) -> alloc::vec::Vec<(u16, u64)> {
+        let mut free = alloc::vec::Vec::with_capacity(SHARDS_PER_VOLUME as usize);
+        for (idx, shard) in self.shards.iter().enumerate() {
+            if let Some(shard) = shard {
+                free.push((idx as u16, shard.free_blocks()));
+            }
+        }
+        free
+    }
 }
 
 // ============================================================================
@@ -474,6 +489,25 @@ pub trait BlockDevice: Send + Sync {
     fn write_block(&self, addr: BlockAddr, buf: &[u8; BLOCK_SIZE]) -> FsResult<()>;
     fn sync(&self) -> FsResult<()>;
     fn trim(&self, addr: BlockAddr) -> FsResult<()>;
+
+    /// Trim a contiguous range starting at `addr` spanning `len` blocks.
+    ///
+    /// The default implementation issues block-by-block trims. Drivers that can
+    /// translate ranges efficiently should override this for better wear leveling
+    /// and lower command overhead.
+    fn trim_range(&self, addr: BlockAddr, len: u64) -> FsResult<()> {
+        for offset in 0..len {
+            let mut next = addr;
+            next.limbs[0] = addr.block_offset().saturating_add(offset);
+            self.trim(next)?;
+        }
+        Ok(())
+    }
+
+    /// Maximum in-flight I/O the device can sustain before queuing.
+    fn queue_depth(&self) -> usize {
+        1
+    }
 }
 
 /// Network transport for remote block access
