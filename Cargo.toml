@@ -11,6 +11,7 @@ categories = ["filesystem", "no-std"]
 
 [lib]
 crate-type = ["staticlib", "rlib"]
+path = "lib.rs"
 
 [features]
 default = ["std"]
@@ -19,6 +20,7 @@ alloc = []
 kernel = []
 fuse = ["std", "dep:fuser", "dep:nix"]
 network = ["std", "dep:socket2", "dep:parking_lot"]
+block-discard = ["std"]
 
 [dependencies]
 bitflags = { version = "2.4", default-features = false }
@@ -38,11 +40,14 @@ tempfile = "3"
 [[example]]
 name = "test_fs"
 required-features = ["std"]
+path = "test_fs.rs"
 
 [[example]]
 name = "fuse_mount"
 required-features = ["fuse"]
+path = "fuse_mount.rs"
 
 [[example]]
 name = "cluster_node"
 required-features = ["network"]
+path = "cluster_node.rs"
