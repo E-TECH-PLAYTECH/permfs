@@ -1,0 +1,72 @@
+name: no-std
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  no-std:
+    name: no-std validation (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain: [stable, nightly]
+    env:
+      CARGO_TARGET_DIR: target/no-std/${{ matrix.toolchain }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust ${{ matrix.toolchain }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      - name: Cargo check (no_std)
+        run: |
+          set -euo pipefail
+          cargo check --no-default-features --features kernel | tee no_std_check_${{ matrix.toolchain }}.log
+
+      - name: Cargo test (no_std-safe)
+        run: |
+          set -euo pipefail
+          cargo test --no-default-features --features kernel --lib --tests -- --nocapture | tee no_std_test_${{ matrix.toolchain }}.log
+
+      - name: Upload no_std logs and build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: no-std-${{ matrix.toolchain }}-artifacts
+          path: |
+            no_std_check_${{ matrix.toolchain }}.log
+            no_std_test_${{ matrix.toolchain }}.log
+            target/no-std/${{ matrix.toolchain }}
+
+  build-std:
+    name: build-std core+alloc
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: target/build-std
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly with build-std support
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rust-src
+          targets: x86_64-unknown-none
+
+      - name: Build with build-std
+        run: |
+          set -euo pipefail
+          cargo +nightly build -Zbuild-std=core,alloc --target x86_64-unknown-none --no-default-features --features kernel | tee build_std.log
+
+      - name: Upload build-std logs and artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-std-artifacts
+          path: |
+            build_std.log
+            target/build-std
