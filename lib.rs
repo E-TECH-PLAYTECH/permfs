@@ -9,39 +9,43 @@
 extern crate alloc;
 
 #[cfg(not(feature = "std"))]
-use alloc::{vec::Vec, boxed::Box, string::String};
+use alloc::{boxed::Box, string::String, vec::Vec};
 #[cfg(feature = "std")]
-use std::{vec::Vec, boxed::Box, string::String};
+use std::{boxed::Box, string::String, vec::Vec};
 
-use core::sync::atomic::{AtomicU64, AtomicU32, Ordering};
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 // ============================================================================
 // MODULE DECLARATIONS
 // ============================================================================
 
-pub mod time;
 pub mod checksum;
-pub mod journal;
 pub mod dir;
-pub mod write;
+pub mod dlm;
+pub mod extent;
+pub mod journal;
 pub mod mkfs;
 pub mod ops;
+pub mod os_porting;
+pub mod time;
+pub mod write;
 pub mod extent;
 pub mod dlm;
 #[cfg(feature = "std")]
 pub mod drivers;
 
-#[cfg(feature = "std")]
-pub mod vfs;
+#[cfg(feature = "fuse")]
+pub mod fuse;
 #[cfg(feature = "std")]
 pub mod mock;
 #[cfg(feature = "network")]
 pub mod transport;
-#[cfg(feature = "fuse")]
-pub mod fuse;
+#[cfg(feature = "std")]
+pub mod vfs;
 
 // Re-exports
+pub use checksum::{compute_inode_checksum, compute_superblock_checksum, crc32c, verify_checksum};
 pub use time::Clock;
 pub use checksum::{crc32c, verify_checksum, compute_inode_checksum, compute_superblock_checksum};
 #[cfg(feature = "std")]
@@ -61,8 +65,14 @@ pub struct BlockAddr {
 
 impl core::fmt::Debug for BlockAddr {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "BlockAddr(node={}, vol={}, shard={}, off={})",
-            self.node_id(), self.volume_id(), self.shard_id(), self.block_offset())
+        write!(
+            f,
+            "BlockAddr(node={}, vol={}, shard={}, off={})",
+            self.node_id(),
+            self.volume_id(),
+            self.shard_id(),
+            self.block_offset()
+        )
     }
 }
 
@@ -74,31 +84,43 @@ impl core::hash::Hash for BlockAddr {
 
 impl BlockAddr {
     pub const NULL: Self = Self { limbs: [0; 4] };
-    pub const MAX: Self = Self { limbs: [u64::MAX; 4] };
+    pub const MAX: Self = Self {
+        limbs: [u64::MAX; 4],
+    };
 
     #[inline]
     pub const fn new(node: u64, volume: u32, shard: u16, offset: u64) -> Self {
         Self {
             limbs: [
-                offset,                                    // low 64 bits: block offset
+                offset,                                   // low 64 bits: block offset
                 ((shard as u64) << 48) | (volume as u64), // shard + volume
-                node,                                      // node id
-                0,                                         // reserved/checksum
+                node,                                     // node id
+                0,                                        // reserved/checksum
             ],
         }
     }
 
     #[inline]
-    pub const fn node_id(&self) -> u64 { self.limbs[2] }
+    pub const fn node_id(&self) -> u64 {
+        self.limbs[2]
+    }
     #[inline]
-    pub const fn volume_id(&self) -> u32 { self.limbs[1] as u32 }
+    pub const fn volume_id(&self) -> u32 {
+        self.limbs[1] as u32
+    }
     #[inline]
-    pub const fn shard_id(&self) -> u16 { (self.limbs[1] >> 48) as u16 }
+    pub const fn shard_id(&self) -> u16 {
+        (self.limbs[1] >> 48) as u16
+    }
     #[inline]
-    pub const fn block_offset(&self) -> u64 { self.limbs[0] }
+    pub const fn block_offset(&self) -> u64 {
+        self.limbs[0]
+    }
 
     #[inline]
-    pub fn is_null(&self) -> bool { *self == Self::NULL }
+    pub fn is_null(&self) -> bool {
+        *self == Self::NULL
+    }
 
     #[inline]
     pub fn is_local(&self, local_node: u64) -> bool {
@@ -132,10 +154,10 @@ impl BlockAddr {
 // FILESYSTEM CONSTANTS
 // ============================================================================
 
-pub const BLOCK_SIZE: usize = 4096;           // 4 KiB blocks
-pub const BLOCKS_PER_SHARD: u64 = 1 << 20;    // 1M blocks per shard = 4 GiB
-pub const SHARDS_PER_VOLUME: u16 = 256;       // 256 shards = 1 TiB per volume
-pub const MAX_VOLUMES_PER_NODE: u32 = 4096;   // 4 PiB max per node
+pub const BLOCK_SIZE: usize = 4096; // 4 KiB blocks
+pub const BLOCKS_PER_SHARD: u64 = 1 << 20; // 1M blocks per shard = 4 GiB
+pub const SHARDS_PER_VOLUME: u16 = 256; // 256 shards = 1 TiB per volume
+pub const MAX_VOLUMES_PER_NODE: u32 = 4096; // 4 PiB max per node
 pub const MAX_FILENAME_LEN: usize = 255;
 pub const INODE_DIRECT_BLOCKS: usize = 12;
 pub const INODE_INDIRECT_LEVELS: usize = 3;
@@ -167,31 +189,37 @@ pub enum BlockType {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Inode {
-    pub mode: u32,                              // file type + permissions
+    pub mode: u32, // file type + permissions
     pub uid: u32,
     pub gid: u32,
     pub flags: u32,
-    pub size: u64,                              // file size in bytes
-    pub blocks: u64,                            // allocated blocks count
-    pub atime: u64,                             // access time (ns since epoch)
-    pub mtime: u64,                             // modify time
-    pub ctime: u64,                             // change time
-    pub crtime: u64,                            // creation time
-    pub nlink: u32,                             // hard link count
-    pub generation: u32,                        // inode generation (for NFS)
-    pub direct: [BlockAddr; INODE_DIRECT_BLOCKS], // direct block pointers
+    pub size: u64,                                    // file size in bytes
+    pub blocks: u64,                                  // allocated blocks count
+    pub atime: u64,                                   // access time (ns since epoch)
+    pub mtime: u64,                                   // modify time
+    pub ctime: u64,                                   // change time
+    pub crtime: u64,                                  // creation time
+    pub nlink: u32,                                   // hard link count
+    pub generation: u32,                              // inode generation (for NFS)
+    pub direct: [BlockAddr; INODE_DIRECT_BLOCKS],     // direct block pointers
     pub indirect: [BlockAddr; INODE_INDIRECT_LEVELS], // single/double/triple indirect
-    pub extent_root: BlockAddr,                 // extent tree root (alternative)
-    pub xattr_block: BlockAddr,                 // extended attributes
+    pub extent_root: BlockAddr,                       // extent tree root (alternative)
+    pub xattr_block: BlockAddr,                       // extended attributes
     pub checksum: u64,
 }
 
 impl Inode {
     pub const SIZE: usize = core::mem::size_of::<Self>();
 
-    pub fn is_dir(&self) -> bool { (self.mode & 0o170000) == 0o040000 }
-    pub fn is_file(&self) -> bool { (self.mode & 0o170000) == 0o100000 }
-    pub fn is_symlink(&self) -> bool { (self.mode & 0o170000) == 0o120000 }
+    pub fn is_dir(&self) -> bool {
+        (self.mode & 0o170000) == 0o040000
+    }
+    pub fn is_file(&self) -> bool {
+        (self.mode & 0o170000) == 0o100000
+    }
+    pub fn is_symlink(&self) -> bool {
+        (self.mode & 0o170000) == 0o120000
+    }
 
     /// Compute and update checksum
     pub fn update_checksum(&mut self) {
@@ -211,10 +239,10 @@ impl Inode {
 
 #[repr(C)]
 pub struct DirEntry {
-    pub inode: u64,                  // inode number
-    pub rec_len: u16,                // total entry length
-    pub name_len: u8,                // filename length
-    pub file_type: u8,               // file type (cached)
+    pub inode: u64,    // inode number
+    pub rec_len: u16,  // total entry length
+    pub name_len: u8,  // filename length
+    pub file_type: u8, // file type (cached)
     pub name: [u8; MAX_FILENAME_LEN],
 }
 
@@ -224,7 +252,7 @@ pub struct DirEntry {
 
 #[repr(C)]
 pub struct Superblock {
-    pub magic: u64,                  // 0x5045524D_46530001 ("PERMFS\x00\x01")
+    pub magic: u64, // 0x5045524D_46530001 ("PERMFS\x00\x01")
     pub version: u32,
     pub block_size: u32,
     pub total_blocks: u64,
@@ -238,7 +266,7 @@ pub struct Superblock {
     pub volume_name: [u8; 64],
     pub mount_count: u32,
     pub max_mount_count: u32,
-    pub state: u16,                  // clean/error
+    pub state: u16, // clean/error
     pub errors_behavior: u16,
     pub first_inode_table: BlockAddr,
     pub journal_start: BlockAddr,
@@ -316,19 +344,19 @@ impl ShardAllocator {
     /// Allocate a block from this shard — lock-free
     pub fn alloc(&self) -> Option<u64> {
         let hint = self.next_hint.load(Ordering::Relaxed) as usize;
-        
+
         // Bounded search: wrap around once
         for attempt in 0..(self.bitmap_words * 2) {
             let word_idx = (hint + attempt) % self.bitmap_words;
             let word = unsafe { &*self.bitmap.as_ptr().add(word_idx) };
-            
+
             let mut current = word.load(Ordering::Relaxed);
-            
+
             // Find first zero bit
             while current != u64::MAX {
                 let bit = (!current).trailing_zeros() as u64;
                 let mask = 1u64 << bit;
-                
+
                 // Try to claim it
                 match word.compare_exchange_weak(
                     current,
@@ -347,7 +375,7 @@ impl ShardAllocator {
                 }
             }
         }
-        
+
         None // Shard exhausted
     }
 
@@ -394,11 +422,11 @@ impl VolumeAllocator {
     /// Allocate a block, trying local shards first
     pub fn alloc_block(&self) -> Result<BlockAddr, AllocError> {
         let start_shard = self.current_shard.fetch_add(1, Ordering::Relaxed) as u16;
-        
+
         // Try all shards starting from current
         for i in 0..SHARDS_PER_VOLUME {
             let shard_id = (start_shard.wrapping_add(i)) % SHARDS_PER_VOLUME;
-            
+
             if let Some(ref shard) = self.shards[shard_id as usize] {
                 if let Some(offset) = shard.alloc() {
                     return Ok(BlockAddr::new(
@@ -410,7 +438,7 @@ impl VolumeAllocator {
                 }
             }
         }
-        
+
         Err(AllocError::NoSpace)
     }
 
@@ -428,7 +456,8 @@ impl VolumeAllocator {
     }
 
     pub fn total_free_blocks(&self) -> u64 {
-        self.shards.iter()
+        self.shards
+            .iter()
             .filter_map(|s| s.as_ref())
             .map(|s| s.free_blocks())
             .sum()
@@ -534,7 +563,7 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
                 }
             }
         }
-        
+
         Err(AllocError::NoSpace)
     }
 
@@ -680,12 +709,7 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
 
 impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
     /// Read file data
-    pub fn read_file(
-        &self,
-        inode: &Inode,
-        offset: u64,
-        buf: &mut [u8],
-    ) -> FsResult<usize> {
+    pub fn read_file(&self, inode: &Inode, offset: u64, buf: &mut [u8]) -> FsResult<usize> {
         if offset >= inode.size {
             return Ok(0);
         }
@@ -697,10 +721,8 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         while file_offset < end {
             let block_addr = self.get_block_for_offset(inode, file_offset)?;
             let offset_in_block = (file_offset % BLOCK_SIZE as u64) as usize;
-            let bytes_in_block = core::cmp::min(
-                BLOCK_SIZE - offset_in_block,
-                (end - file_offset) as usize,
-            );
+            let bytes_in_block =
+                core::cmp::min(BLOCK_SIZE - offset_in_block, (end - file_offset) as usize);
 
             let mut block_buf = [0u8; BLOCK_SIZE];
             self.read_block(block_addr, &mut block_buf)?;
