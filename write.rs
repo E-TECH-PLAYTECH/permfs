@@ -22,9 +22,8 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
             self.read_block(bitmap_addr, &mut buf)?;
 
             for word_idx in 0..(BLOCK_SIZE / 8) {
-                let word = u64::from_le_bytes(
-                    buf[word_idx * 8..(word_idx + 1) * 8].try_into().unwrap()
-                );
+                let word =
+                    u64::from_le_bytes(buf[word_idx * 8..(word_idx + 1) * 8].try_into().unwrap());
 
                 if word != u64::MAX {
                     let bit = (!word).trailing_zeros() as u64;
@@ -36,8 +35,7 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
 
                     // Set the bit
                     let new_word = word | (1u64 << bit);
-                    buf[word_idx * 8..(word_idx + 1) * 8]
-                        .copy_from_slice(&new_word.to_le_bytes());
+                    buf[word_idx * 8..(word_idx + 1) * 8].copy_from_slice(&new_word.to_le_bytes());
 
                     self.write_block(bitmap_addr, &buf)?;
                     sb.free_inodes.fetch_sub(1, Ordering::Relaxed);
@@ -63,9 +61,7 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         let mut buf = [0u8; BLOCK_SIZE];
         self.read_block(bitmap_addr, &mut buf)?;
 
-        let word = u64::from_le_bytes(
-            buf[word_idx * 8..(word_idx + 1) * 8].try_into().unwrap()
-        );
+        let word = u64::from_le_bytes(buf[word_idx * 8..(word_idx + 1) * 8].try_into().unwrap());
 
         let new_word = word & !(1u64 << bit_in_word);
         buf[word_idx * 8..(word_idx + 1) * 8].copy_from_slice(&new_word.to_le_bytes());
@@ -109,7 +105,8 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
                 Ok(addr) => addr,
                 Err(IoError::NotFound) => {
                     // Allocate new block
-                    let new_block = self.alloc_block(Some(sb.volume_id))
+                    let new_block = self
+                        .alloc_block(Some(sb.volume_id))
                         .map_err(|_| IoError::IoFailed)?;
                     self.set_block_for_offset(inode, file_offset, new_block, sb)?;
                     inode.blocks += 1;
@@ -166,7 +163,8 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         // Single indirect
         if remaining < ptrs_per_block {
             if inode.indirect[0].is_null() {
-                inode.indirect[0] = self.alloc_block(Some(sb.volume_id))
+                inode.indirect[0] = self
+                    .alloc_block(Some(sb.volume_id))
                     .map_err(|_| IoError::IoFailed)?;
                 self.zero_block(inode.indirect[0])?;
                 inode.blocks += 1;
@@ -179,7 +177,8 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         let double_limit = ptrs_per_block * ptrs_per_block;
         if remaining < double_limit {
             if inode.indirect[1].is_null() {
-                inode.indirect[1] = self.alloc_block(Some(sb.volume_id))
+                inode.indirect[1] = self
+                    .alloc_block(Some(sb.volume_id))
                     .map_err(|_| IoError::IoFailed)?;
                 self.zero_block(inode.indirect[1])?;
                 inode.blocks += 1;
@@ -188,11 +187,13 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
             let l1_idx = remaining / ptrs_per_block;
             let l2_idx = remaining % ptrs_per_block;
 
-            let mut l1_block = self.read_indirect_ptr(inode.indirect[1], l1_idx as usize)
+            let mut l1_block = self
+                .read_indirect_ptr(inode.indirect[1], l1_idx as usize)
                 .unwrap_or(BlockAddr::NULL);
 
             if l1_block.is_null() {
-                l1_block = self.alloc_block(Some(sb.volume_id))
+                l1_block = self
+                    .alloc_block(Some(sb.volume_id))
                     .map_err(|_| IoError::IoFailed)?;
                 self.zero_block(l1_block)?;
                 self.write_indirect_ptr(inode.indirect[1], l1_idx as usize, l1_block)?;
@@ -205,7 +206,8 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
 
         // Triple indirect
         if inode.indirect[2].is_null() {
-            inode.indirect[2] = self.alloc_block(Some(sb.volume_id))
+            inode.indirect[2] = self
+                .alloc_block(Some(sb.volume_id))
                 .map_err(|_| IoError::IoFailed)?;
             self.zero_block(inode.indirect[2])?;
             inode.blocks += 1;
@@ -215,20 +217,24 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         let l2_idx = (remaining / ptrs_per_block) % ptrs_per_block;
         let l3_idx = remaining % ptrs_per_block;
 
-        let mut l1_block = self.read_indirect_ptr(inode.indirect[2], l1_idx as usize)
+        let mut l1_block = self
+            .read_indirect_ptr(inode.indirect[2], l1_idx as usize)
             .unwrap_or(BlockAddr::NULL);
         if l1_block.is_null() {
-            l1_block = self.alloc_block(Some(sb.volume_id))
+            l1_block = self
+                .alloc_block(Some(sb.volume_id))
                 .map_err(|_| IoError::IoFailed)?;
             self.zero_block(l1_block)?;
             self.write_indirect_ptr(inode.indirect[2], l1_idx as usize, l1_block)?;
             inode.blocks += 1;
         }
 
-        let mut l2_block = self.read_indirect_ptr(l1_block, l2_idx as usize)
+        let mut l2_block = self
+            .read_indirect_ptr(l1_block, l2_idx as usize)
             .unwrap_or(BlockAddr::NULL);
         if l2_block.is_null() {
-            l2_block = self.alloc_block(Some(sb.volume_id))
+            l2_block = self
+                .alloc_block(Some(sb.volume_id))
                 .map_err(|_| IoError::IoFailed)?;
             self.zero_block(l2_block)?;
             self.write_indirect_ptr(l1_block, l2_idx as usize, l2_block)?;

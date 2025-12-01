@@ -1,7 +1,7 @@
 // PermFS Extended Operations — rename, link, symlink, readlink
 
-use crate::*;
 use crate::dir::file_type;
+use crate::*;
 
 const INLINE_SYMLINK_MAX: usize = INODE_DIRECT_BLOCKS * core::mem::size_of::<BlockAddr>();
 
@@ -69,7 +69,8 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
                 core::ptr::copy_nonoverlapping(target.as_ptr(), ptr, target.len());
             }
         } else {
-            let block = self.alloc_block(Some(sb.volume_id))
+            let block = self
+                .alloc_block(Some(sb.volume_id))
                 .map_err(|_| IoError::IoFailed)?;
             let mut buf = [0u8; BLOCK_SIZE];
             buf[..target.len()].copy_from_slice(target);
@@ -85,12 +86,7 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
     }
 
     /// Read symbolic link target
-    pub fn readlink_impl(
-        &self,
-        ino: u64,
-        buf: &mut [u8],
-        sb: &Superblock,
-    ) -> FsResult<usize> {
+    pub fn readlink_impl(&self, ino: u64, buf: &mut [u8], sb: &Superblock) -> FsResult<usize> {
         let inode = self.read_inode(ino, sb)?;
         if !inode.is_symlink() {
             return Err(IoError::InvalidAddress);
@@ -192,12 +188,25 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
     }
 
     /// Get extended attribute (stub)
-    pub fn getxattr(&self, _ino: u64, _name: &[u8], _buf: &mut [u8], _sb: &Superblock) -> FsResult<usize> {
+    pub fn getxattr(
+        &self,
+        _ino: u64,
+        _name: &[u8],
+        _buf: &mut [u8],
+        _sb: &Superblock,
+    ) -> FsResult<usize> {
         Err(IoError::NotFound)
     }
 
     /// Set extended attribute (stub)
-    pub fn setxattr(&self, _ino: u64, _name: &[u8], _value: &[u8], _flags: u32, _sb: &Superblock) -> FsResult<()> {
+    pub fn setxattr(
+        &self,
+        _ino: u64,
+        _name: &[u8],
+        _value: &[u8],
+        _flags: u32,
+        _sb: &Superblock,
+    ) -> FsResult<()> {
         Err(IoError::IoFailed)
     }
 

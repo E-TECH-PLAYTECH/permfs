@@ -3,8 +3,8 @@
 #![cfg(feature = "std")]
 
 use crate::*;
+use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
-use std::sync::atomic::AtomicU32;
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,7 +63,13 @@ pub trait VfsOperations {
     fn mkdir(&self, parent: u64, name: &[u8], mode: u32) -> FsResult<u64>;
     fn unlink(&self, parent: u64, name: &[u8]) -> FsResult<()>;
     fn rmdir(&self, parent: u64, name: &[u8]) -> FsResult<()>;
-    fn rename(&self, old_parent: u64, old_name: &[u8], new_parent: u64, new_name: &[u8]) -> FsResult<()>;
+    fn rename(
+        &self,
+        old_parent: u64,
+        old_name: &[u8],
+        new_parent: u64,
+        new_name: &[u8],
+    ) -> FsResult<()>;
     fn link(&self, ino: u64, new_parent: u64, new_name: &[u8]) -> FsResult<()>;
     fn symlink(&self, parent: u64, name: &[u8], target: &[u8]) -> FsResult<u64>;
     fn readlink(&self, ino: u64, buf: &mut [u8]) -> FsResult<usize>;
@@ -73,7 +79,12 @@ pub trait VfsOperations {
     fn seek(&self, handle: &mut FileHandle, offset: i64, whence: SeekWhence) -> FsResult<u64>;
     fn fsync(&self, handle: &FileHandle) -> FsResult<()>;
     fn close(&self, handle: FileHandle) -> FsResult<()>;
-    fn readdir(&self, ino: u64, offset: u64, callback: &mut dyn FnMut(&DirEntry) -> bool) -> FsResult<()>;
+    fn readdir(
+        &self,
+        ino: u64,
+        offset: u64,
+        callback: &mut dyn FnMut(&DirEntry) -> bool,
+    ) -> FsResult<()>;
     fn getattr(&self, ino: u64) -> FsResult<Inode>;
     fn setattr(&self, ino: u64, attr: &SetAttr) -> FsResult<Inode>;
     fn truncate(&self, ino: u64, size: u64) -> FsResult<()>;
@@ -98,10 +109,17 @@ impl<B: BlockDevice, T: ClusterTransport> VfsOperations for PermFs<B, T> {
 
         let inode = Inode {
             mode: mode | 0o100000,
-            uid: 0, gid: 0, flags: 0,
-            size: 0, blocks: 0,
-            atime: now, mtime: now, ctime: now, crtime: now,
-            nlink: 1, generation: 0,
+            uid: 0,
+            gid: 0,
+            flags: 0,
+            size: 0,
+            blocks: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            crtime: now,
+            nlink: 1,
+            generation: 0,
             direct: [BlockAddr::NULL; INODE_DIRECT_BLOCKS],
             indirect: [BlockAddr::NULL; INODE_INDIRECT_LEVELS],
             extent_root: BlockAddr::NULL,
@@ -119,14 +137,22 @@ impl<B: BlockDevice, T: ClusterTransport> VfsOperations for PermFs<B, T> {
         let ino = self.alloc_inode(&sb)?;
         let now = self.current_time();
 
-        let dir_block = self.alloc_block(Some(sb.volume_id)).map_err(|_| IoError::IoFailed)?;
+        let dir_block = self
+            .alloc_block(Some(sb.volume_id))
+            .map_err(|_| IoError::IoFailed)?;
         let mut inode = Inode {
             mode: mode | 0o040000,
-            uid: 0, gid: 0, flags: 0,
+            uid: 0,
+            gid: 0,
+            flags: 0,
             size: BLOCK_SIZE as u64,
             blocks: 1,
-            atime: now, mtime: now, ctime: now, crtime: now,
-            nlink: 2, generation: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            crtime: now,
+            nlink: 2,
+            generation: 0,
             direct: [BlockAddr::NULL; INODE_DIRECT_BLOCKS],
             indirect: [BlockAddr::NULL; INODE_INDIRECT_LEVELS],
             extent_root: BlockAddr::NULL,
@@ -254,7 +280,12 @@ impl<B: BlockDevice, T: ClusterTransport> VfsOperations for PermFs<B, T> {
         Ok(())
     }
 
-    fn readdir(&self, ino: u64, offset: u64, callback: &mut dyn FnMut(&DirEntry) -> bool) -> FsResult<()> {
+    fn readdir(
+        &self,
+        ino: u64,
+        offset: u64,
+        callback: &mut dyn FnMut(&DirEntry) -> bool,
+    ) -> FsResult<()> {
         let sb = self.read_superblock()?;
         let inode = self.read_inode(ino, &sb)?;
 
@@ -270,9 +301,8 @@ impl<B: BlockDevice, T: ClusterTransport> VfsOperations for PermFs<B, T> {
 
             let mut block_pos = (pos % BLOCK_SIZE as u64) as usize;
             while block_pos + DirEntry::HEADER_SIZE <= BLOCK_SIZE {
-                let entry: &DirEntry = unsafe {
-                    &*(buf.as_ptr().add(block_pos) as *const DirEntry)
-                };
+                let entry: &DirEntry =
+                    unsafe { &*(buf.as_ptr().add(block_pos) as *const DirEntry) };
 
                 if entry.rec_len == 0 {
                     break;
@@ -300,14 +330,24 @@ impl<B: BlockDevice, T: ClusterTransport> VfsOperations for PermFs<B, T> {
         let sb = self.read_superblock()?;
         let mut inode = self.read_inode(ino, &sb)?;
 
-        if attr.valid & 0x01 != 0 { inode.mode = attr.mode; }
-        if attr.valid & 0x02 != 0 { inode.uid = attr.uid; }
-        if attr.valid & 0x04 != 0 { inode.gid = attr.gid; }
-        if attr.valid & 0x08 != 0 { 
+        if attr.valid & 0x01 != 0 {
+            inode.mode = attr.mode;
+        }
+        if attr.valid & 0x02 != 0 {
+            inode.uid = attr.uid;
+        }
+        if attr.valid & 0x04 != 0 {
+            inode.gid = attr.gid;
+        }
+        if attr.valid & 0x08 != 0 {
             self.truncate_internal(&mut inode, attr.size, &sb)?;
         }
-        if attr.valid & 0x10 != 0 { inode.atime = attr.atime; }
-        if attr.valid & 0x20 != 0 { inode.mtime = attr.mtime; }
+        if attr.valid & 0x10 != 0 {
+            inode.atime = attr.atime;
+        }
+        if attr.valid & 0x20 != 0 {
+            inode.mtime = attr.mtime;
+        }
 
         inode.ctime = self.current_time();
         self.write_inode(ino, &inode, &sb)?;
@@ -337,7 +377,13 @@ impl<B: BlockDevice, T: ClusterTransport> VfsOperations for PermFs<B, T> {
         self.local_device.sync()
     }
 
-    fn rename(&self, old_parent: u64, old_name: &[u8], new_parent: u64, new_name: &[u8]) -> FsResult<()> {
+    fn rename(
+        &self,
+        old_parent: u64,
+        old_name: &[u8],
+        new_parent: u64,
+        new_name: &[u8],
+    ) -> FsResult<()> {
         let sb = self.read_superblock()?;
         self.rename_impl(old_parent, old_name, new_parent, new_name, &sb)
     }

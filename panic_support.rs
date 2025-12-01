@@ -5,6 +5,8 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::sync::RwLock;
+
 /// Result returned by components that quiesce during a panic.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PanicQuiesceResult {
@@ -62,6 +64,17 @@ impl Default for AllocatorEvent {
     }
 }
 
+impl AllocatorEvent {
+    pub const fn zeroed() -> Self {
+        Self {
+            ts_ns: 0,
+            shard_id: None,
+            detail: 0,
+            kind: AllocatorEventKind::AllocationFailed,
+        }
+    }
+}
+
 const ALLOC_EVENT_CAPACITY: usize = 64;
 
 struct AllocatorEventRing {
@@ -75,7 +88,7 @@ impl AllocatorEventRing {
     const fn new() -> Self {
         Self {
             write_cursor: AtomicUsize::new(0),
-            buffer: UnsafeCell::new([AllocatorEvent::default(); ALLOC_EVENT_CAPACITY]),
+            buffer: UnsafeCell::new([AllocatorEvent::zeroed(); ALLOC_EVENT_CAPACITY]),
         }
     }
 
@@ -117,82 +130,53 @@ pub trait AllocatorPanicReporter: Send + Sync {
     fn allocator_panic_report(&self) -> AllocatorPanicReport;
 }
 
-fn store_dyn_trait<T: ?Sized>(slots: &DynTraitSlots, value: Option<&'static T>) {
-    if let Some(val) = value {
-        let raw: *const T = val;
-        let parts: (usize, usize) = unsafe { core::mem::transmute(raw) };
-        slots.data.store(parts.0, Ordering::Release);
-        slots.vtable.store(parts.1, Ordering::Release);
-    } else {
-        slots.data.store(0, Ordering::Release);
-        slots.vtable.store(0, Ordering::Release);
-    }
-}
-
-fn load_dyn_trait<T: ?Sized>(slots: &DynTraitSlots) -> Option<&'static T> {
-    let data = slots.data.load(Ordering::Acquire);
-    let vtable = slots.vtable.load(Ordering::Acquire);
-    if data == 0 || vtable == 0 {
-        None
-    } else {
-        let parts = (data, vtable);
-        let ptr: *const T = unsafe { core::mem::transmute(parts) };
-        Some(unsafe { &*ptr })
-    }
-}
-
-struct DynTraitSlots {
-    data: AtomicUsize,
-    vtable: AtomicUsize,
-}
-
-impl DynTraitSlots {
-    const fn new() -> Self {
-        Self {
-            data: AtomicUsize::new(0),
-            vtable: AtomicUsize::new(0),
-        }
-    }
-}
-
-static PANIC_QUIESCE: DynTraitSlots = DynTraitSlots::new();
-static ALLOCATOR_REPORTER: DynTraitSlots = DynTraitSlots::new();
+static PANIC_QUIESCE: RwLock<Option<&'static dyn PanicQuiesce>> = RwLock::new(None);
+static ALLOCATOR_REPORTER: RwLock<Option<&'static dyn AllocatorPanicReporter>> = RwLock::new(None);
 
 /// Register a panic quiesce handler (e.g., block driver). The handler must live
 /// for the duration of the program; callers typically leak an `Arc` or place
 /// the object in static storage.
 pub fn register_panic_quiesce(handler: Option<&'static dyn PanicQuiesce>) {
-    store_dyn_trait(&PANIC_QUIESCE, handler);
+    if let Ok(mut slot) = PANIC_QUIESCE.write() {
+        *slot = handler;
+    }
 }
 
 /// Register an allocator panic reporter that exposes allocator health in the
 /// panic path.
 pub fn register_allocator_reporter(handler: Option<&'static dyn AllocatorPanicReporter>) {
-    store_dyn_trait(&ALLOCATOR_REPORTER, handler);
+    if let Ok(mut slot) = ALLOCATOR_REPORTER.write() {
+        *slot = handler;
+    }
 }
 
 /// Invoke the registered quiesce handler if present.
 pub fn try_panic_quiesce() -> Option<PanicQuiesceResult> {
-    load_dyn_trait::<dyn PanicQuiesce>(&PANIC_QUIESCE).map(|handler| handler.panic_freeze())
+    PANIC_QUIESCE
+        .read()
+        .ok()
+        .and_then(|handler| handler.map(|h| h.panic_freeze()))
 }
 
 /// Obtain the allocator panic report, falling back to ring-only information if
 /// no reporter has been registered.
 pub fn allocator_panic_report() -> AllocatorPanicReport {
-    if let Some(handler) = load_dyn_trait::<dyn AllocatorPanicReporter>(&ALLOCATOR_REPORTER) {
-        handler.allocator_panic_report()
-    } else {
-        let (events, head, total) = ALLOC_EVENT_RING.snapshot();
-        AllocatorPanicReport {
-            epoch: 0,
-            shards_total: 0,
-            shards_with_pressure: 0,
-            free_blocks: 0,
-            last_errors: events,
-            events_head: head,
-            events_recorded: total,
-            double_free_guard_hits: 0,
+    if let Ok(guard) = ALLOCATOR_REPORTER.read() {
+        if let Some(handler) = *guard {
+            return handler.allocator_panic_report();
         }
+    }
+
+    let (events, head, total) = ALLOC_EVENT_RING.snapshot();
+    AllocatorPanicReport {
+        epoch: 0,
+        shards_total: 0,
+        shards_with_pressure: 0,
+        free_blocks: 0,
+        last_errors: events,
+        events_head: head,
+        events_recorded: total,
+        double_free_guard_hits: 0,
     }
 }
 

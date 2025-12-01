@@ -2,11 +2,10 @@
 
 #![cfg(feature = "std")]
 
+use crate::sync::{Arc, RwLock};
 use crate::*;
-use std::collections::HashMap;
-use std::sync::RwLock;
 use core::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::collections::HashMap;
 
 pub struct MemoryBlockDevice {
     blocks: RwLock<HashMap<BlockAddr, [u8; BLOCK_SIZE]>>,
@@ -59,7 +58,12 @@ impl BlockDevice for MemoryBlockDevice {
 pub struct NullTransport;
 
 impl ClusterTransport for NullTransport {
-    fn read_remote(&self, _node: u64, _addr: BlockAddr, _buf: &mut [u8; BLOCK_SIZE]) -> FsResult<()> {
+    fn read_remote(
+        &self,
+        _node: u64,
+        _addr: BlockAddr,
+        _buf: &mut [u8; BLOCK_SIZE],
+    ) -> FsResult<()> {
         Err(IoError::NetworkTimeout)
     }
 
@@ -168,10 +172,17 @@ mod tests {
 
         let inode = Inode {
             mode: 0o100644,
-            uid: 1000, gid: 1000, flags: 0,
-            size: 0, blocks: 0,
-            atime: 0, mtime: 0, ctime: 0, crtime: 0,
-            nlink: 1, generation: 0,
+            uid: 1000,
+            gid: 1000,
+            flags: 0,
+            size: 0,
+            blocks: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            crtime: 0,
+            nlink: 1,
+            generation: 0,
             direct: [BlockAddr::NULL; INODE_DIRECT_BLOCKS],
             indirect: [BlockAddr::NULL; INODE_INDIRECT_LEVELS],
             extent_root: BlockAddr::NULL,
@@ -180,7 +191,8 @@ mod tests {
         };
 
         fs.write_inode(ino, &inode, &sb).expect("write inode");
-        fs.add_dirent(0, b"testfile", ino, 1, &sb).expect("add dirent");
+        fs.add_dirent(0, b"testfile", ino, 1, &sb)
+            .expect("add dirent");
 
         let root = fs.read_inode(0, &sb).expect("read root");
         let found = fs.find_dirent(&root, b"testfile").expect("find dirent");
@@ -194,10 +206,17 @@ mod tests {
         let ino = fs.alloc_inode(&sb).expect("alloc inode");
         let mut inode = Inode {
             mode: 0o100644,
-            uid: 0, gid: 0, flags: 0,
-            size: 0, blocks: 0,
-            atime: 0, mtime: 0, ctime: 0, crtime: 0,
-            nlink: 1, generation: 0,
+            uid: 0,
+            gid: 0,
+            flags: 0,
+            size: 0,
+            blocks: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            crtime: 0,
+            nlink: 1,
+            generation: 0,
             direct: [BlockAddr::NULL; INODE_DIRECT_BLOCKS],
             indirect: [BlockAddr::NULL; INODE_INDIRECT_LEVELS],
             extent_root: BlockAddr::NULL,
@@ -229,10 +248,17 @@ mod tests {
         let ino = fs.alloc_inode(&sb).expect("alloc inode");
         let mut inode = Inode {
             mode: 0o100644,
-            uid: 0, gid: 0, flags: 0,
-            size: 0, blocks: 0,
-            atime: 0, mtime: 0, ctime: 0, crtime: 0,
-            nlink: 1, generation: 0,
+            uid: 0,
+            gid: 0,
+            flags: 0,
+            size: 0,
+            blocks: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            crtime: 0,
+            nlink: 1,
+            generation: 0,
             direct: [BlockAddr::NULL; INODE_DIRECT_BLOCKS],
             indirect: [BlockAddr::NULL; INODE_INDIRECT_LEVELS],
             extent_root: BlockAddr::NULL,
@@ -243,7 +269,8 @@ mod tests {
         let chunk = vec![0xABu8; BLOCK_SIZE];
         for i in 0..25 {
             let offset = i * BLOCK_SIZE;
-            fs.write_file(&mut inode, offset as u64, &chunk, &sb).expect("write chunk");
+            fs.write_file(&mut inode, offset as u64, &chunk, &sb)
+                .expect("write chunk");
         }
 
         assert_eq!(inode.size, 25 * BLOCK_SIZE as u64);
@@ -254,7 +281,9 @@ mod tests {
         }
 
         let mut buf = vec![0u8; BLOCK_SIZE];
-        let read = fs.read_file(&inode, 20 * BLOCK_SIZE as u64, &mut buf).expect("read");
+        let read = fs
+            .read_file(&inode, 20 * BLOCK_SIZE as u64, &mut buf)
+            .expect("read");
         assert_eq!(read, BLOCK_SIZE);
         assert!(buf.iter().all(|&b| b == 0xAB));
     }
@@ -268,10 +297,15 @@ mod tests {
 
         let mut inode = Inode {
             mode: 0o040755,
-            uid: 0, gid: 0, flags: 0,
+            uid: 0,
+            gid: 0,
+            flags: 0,
             size: BLOCK_SIZE as u64,
             blocks: 1,
-            atime: 0, mtime: 0, ctime: 0, crtime: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            crtime: 0,
             nlink: 2,
             generation: 0,
             direct: [BlockAddr::NULL; INODE_DIRECT_BLOCKS],
@@ -282,9 +316,11 @@ mod tests {
         };
         inode.direct[0] = dir_block;
 
-        fs.init_directory_block(dir_block, ino, 0).expect("init dir");
+        fs.init_directory_block(dir_block, ino, 0)
+            .expect("init dir");
         fs.write_inode(ino, &inode, &sb).expect("write inode");
-        fs.add_dirent(0, b"subdir", ino, 2, &sb).expect("add dirent");
+        fs.add_dirent(0, b"subdir", ino, 2, &sb)
+            .expect("add dirent");
 
         assert!(fs.is_dir_empty(ino, &sb).expect("is_dir_empty"));
 

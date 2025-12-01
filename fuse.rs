@@ -2,17 +2,16 @@
 
 #![cfg(feature = "fuse")]
 
+use crate::sync::{Arc, Mutex, RwLock};
+use crate::vfs::{OpenFlags, StatFs, VfsOperations};
 use crate::*;
-use crate::vfs::{OpenFlags, VfsOperations, StatFs};
+use fuser::{
+    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+};
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
-    Request, TimeOrNow,
-};
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -87,11 +86,11 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> FuseFs<B, T> {
             block_size: sb.block_size,
             total_blocks: sb.total_blocks,
             free_blocks: core::sync::atomic::AtomicU64::new(
-                sb.free_blocks.load(core::sync::atomic::Ordering::Relaxed)
+                sb.free_blocks.load(core::sync::atomic::Ordering::Relaxed),
             ),
             total_inodes: sb.total_inodes,
             free_inodes: core::sync::atomic::AtomicU64::new(
-                sb.free_inodes.load(core::sync::atomic::Ordering::Relaxed)
+                sb.free_inodes.load(core::sync::atomic::Ordering::Relaxed),
             ),
             node_id: sb.node_id,
             volume_id: sb.volume_id,
@@ -133,17 +132,26 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
 
         let parent_inode = match self.fs.read_inode(parent, &sb) {
             Ok(i) => i,
-            Err(_) => { reply.error(libc::ENOENT); return; }
+            Err(_) => {
+                reply.error(libc::ENOENT);
+                return;
+            }
         };
 
         let ino = match self.fs.find_dirent(&parent_inode, name.as_bytes()) {
             Ok(i) => i,
-            Err(_) => { reply.error(libc::ENOENT); return; }
+            Err(_) => {
+                reply.error(libc::ENOENT);
+                return;
+            }
         };
 
         let inode = match self.fs.read_inode(ino, &sb) {
             Ok(i) => i,
-            Err(_) => { reply.error(libc::EIO); return; }
+            Err(_) => {
+                reply.error(libc::EIO);
+                return;
+            }
         };
 
         reply.entry(&TTL, &inode_to_attr(ino, &inode), 0);
@@ -178,12 +186,21 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         let sb = self.sb();
         let mut inode = match self.fs.read_inode(ino, &sb) {
             Ok(i) => i,
-            Err(_) => { reply.error(libc::ENOENT); return; }
+            Err(_) => {
+                reply.error(libc::ENOENT);
+                return;
+            }
         };
 
-        if let Some(m) = mode { inode.mode = (inode.mode & 0o170000) | (m & 0o7777); }
-        if let Some(u) = uid { inode.uid = u; }
-        if let Some(g) = gid { inode.gid = g; }
+        if let Some(m) = mode {
+            inode.mode = (inode.mode & 0o170000) | (m & 0o7777);
+        }
+        if let Some(u) = uid {
+            inode.uid = u;
+        }
+        if let Some(g) = gid {
+            inode.gid = g;
+        }
         if let Some(s) = size {
             if let Err(_) = self.fs.truncate_internal(&mut inode, s, &sb) {
                 reply.error(libc::EIO);
@@ -212,28 +229,48 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         reply.attr(&TTL, &inode_to_attr(ino, &inode));
     }
 
-    fn mkdir(&mut self, _req: &Request, parent: u64, name: &OsStr, mode: u32, _umask: u32, reply: ReplyEntry) {
+    fn mkdir(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
         let sb = self.sb();
         let name = name.to_string_lossy();
 
         let ino = match self.fs.alloc_inode(&sb) {
             Ok(i) => i,
-            Err(_) => { reply.error(libc::ENOSPC); return; }
+            Err(_) => {
+                reply.error(libc::ENOSPC);
+                return;
+            }
         };
 
         let dir_block = match self.fs.alloc_block(Some(sb.volume_id)) {
             Ok(b) => b,
-            Err(_) => { reply.error(libc::ENOSPC); return; }
+            Err(_) => {
+                reply.error(libc::ENOSPC);
+                return;
+            }
         };
 
         let now = self.fs.current_time();
         let mut inode = Inode {
             mode: 0o040000 | (mode & 0o7777),
-            uid: 0, gid: 0, flags: 0,
+            uid: 0,
+            gid: 0,
+            flags: 0,
             size: BLOCK_SIZE as u64,
             blocks: 1,
-            atime: now, mtime: now, ctime: now, crtime: now,
-            nlink: 2, generation: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            crtime: now,
+            nlink: 2,
+            generation: 0,
             direct: [BlockAddr::NULL; INODE_DIRECT_BLOCKS],
             indirect: [BlockAddr::NULL; INODE_INDIRECT_LEVELS],
             extent_root: BlockAddr::NULL,
@@ -242,16 +279,26 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         };
         inode.direct[0] = dir_block;
 
-        if self.fs.init_directory_block(dir_block, ino, parent).is_err() ||
-           self.fs.write_inode(ino, &inode, &sb).is_err() ||
-           self.fs.add_dirent(parent, name.as_bytes(), ino, 2, &sb).is_err() {
+        if self
+            .fs
+            .init_directory_block(dir_block, ino, parent)
+            .is_err()
+            || self.fs.write_inode(ino, &inode, &sb).is_err()
+            || self
+                .fs
+                .add_dirent(parent, name.as_bytes(), ino, 2, &sb)
+                .is_err()
+        {
             reply.error(libc::EIO);
             return;
         }
 
         let mut parent_inode = match self.fs.read_inode(parent, &sb) {
             Ok(i) => i,
-            Err(_) => { reply.error(libc::EIO); return; }
+            Err(_) => {
+                reply.error(libc::EIO);
+                return;
+            }
         };
         parent_inode.nlink += 1;
         let _ = self.fs.write_inode(parent, &parent_inode, &sb);
@@ -274,16 +321,26 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
 
         let ino = match self.fs.alloc_inode(&sb) {
             Ok(i) => i,
-            Err(_) => { reply.error(libc::ENOSPC); return; }
+            Err(_) => {
+                reply.error(libc::ENOSPC);
+                return;
+            }
         };
 
         let now = self.fs.current_time();
         let inode = Inode {
             mode: 0o100000 | (mode & 0o7777),
-            uid: 0, gid: 0, flags: 0,
-            size: 0, blocks: 0,
-            atime: now, mtime: now, ctime: now, crtime: now,
-            nlink: 1, generation: 0,
+            uid: 0,
+            gid: 0,
+            flags: 0,
+            size: 0,
+            blocks: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            crtime: now,
+            nlink: 1,
+            generation: 0,
             direct: [BlockAddr::NULL; INODE_DIRECT_BLOCKS],
             indirect: [BlockAddr::NULL; INODE_INDIRECT_LEVELS],
             extent_root: BlockAddr::NULL,
@@ -291,17 +348,24 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
             checksum: 0,
         };
 
-        if self.fs.write_inode(ino, &inode, &sb).is_err() ||
-           self.fs.add_dirent(parent, name.as_bytes(), ino, 1, &sb).is_err() {
+        if self.fs.write_inode(ino, &inode, &sb).is_err()
+            || self
+                .fs
+                .add_dirent(parent, name.as_bytes(), ino, 1, &sb)
+                .is_err()
+        {
             reply.error(libc::EIO);
             return;
         }
 
         let fh = self.alloc_fh();
-        self.open_files.lock().unwrap().insert(fh, OpenFile {
-            ino,
-            flags: OpenFlags::READ | OpenFlags::WRITE,
-        });
+        self.open_files.lock().unwrap().insert(
+            fh,
+            OpenFile {
+                ino,
+                flags: OpenFlags::READ | OpenFlags::WRITE,
+            },
+        );
 
         reply.created(&TTL, &inode_to_attr(ino, &inode), 0, fh, 0);
     }
@@ -312,17 +376,26 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
 
         let parent_inode = match self.fs.read_inode(parent, &sb) {
             Ok(i) => i,
-            Err(_) => { reply.error(libc::ENOENT); return; }
+            Err(_) => {
+                reply.error(libc::ENOENT);
+                return;
+            }
         };
 
         let ino = match self.fs.find_dirent(&parent_inode, name.as_bytes()) {
             Ok(i) => i,
-            Err(_) => { reply.error(libc::ENOENT); return; }
+            Err(_) => {
+                reply.error(libc::ENOENT);
+                return;
+            }
         };
 
         let mut inode = match self.fs.read_inode(ino, &sb) {
             Ok(i) => i,
-            Err(_) => { reply.error(libc::EIO); return; }
+            Err(_) => {
+                reply.error(libc::EIO);
+                return;
+            }
         };
 
         if inode.is_dir() {
@@ -354,17 +427,26 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
 
         let parent_inode = match self.fs.read_inode(parent, &sb) {
             Ok(i) => i,
-            Err(_) => { reply.error(libc::ENOENT); return; }
+            Err(_) => {
+                reply.error(libc::ENOENT);
+                return;
+            }
         };
 
         let ino = match self.fs.find_dirent(&parent_inode, name.as_bytes()) {
             Ok(i) => i,
-            Err(_) => { reply.error(libc::ENOENT); return; }
+            Err(_) => {
+                reply.error(libc::ENOENT);
+                return;
+            }
         };
 
         let inode = match self.fs.read_inode(ino, &sb) {
             Ok(i) => i,
-            Err(_) => { reply.error(libc::EIO); return; }
+            Err(_) => {
+                reply.error(libc::EIO);
+                return;
+            }
         };
 
         if !inode.is_dir() {
@@ -374,8 +456,14 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
 
         match self.fs.is_dir_empty(ino, &sb) {
             Ok(true) => {}
-            Ok(false) => { reply.error(libc::ENOTEMPTY); return; }
-            Err(_) => { reply.error(libc::EIO); return; }
+            Ok(false) => {
+                reply.error(libc::ENOTEMPTY);
+                return;
+            }
+            Err(_) => {
+                reply.error(libc::EIO);
+                return;
+            }
         }
 
         let _ = self.fs.remove_dirent(parent, name.as_bytes(), &sb);
@@ -384,7 +472,10 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
 
         let mut parent_inode = match self.fs.read_inode(parent, &sb) {
             Ok(i) => i,
-            Err(_) => { reply.ok(); return; }
+            Err(_) => {
+                reply.ok();
+                return;
+            }
         };
         parent_inode.nlink -= 1;
         let _ = self.fs.write_inode(parent, &parent_inode, &sb);
@@ -402,28 +493,47 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         let fh = self.alloc_fh();
         let open_flags = OpenFlags::from_bits_truncate(flags as u32);
 
-        self.open_files.lock().unwrap().insert(fh, OpenFile {
-            ino,
-            flags: open_flags,
-        });
+        self.open_files.lock().unwrap().insert(
+            fh,
+            OpenFile {
+                ino,
+                flags: open_flags,
+            },
+        );
 
         reply.opened(fh, 0);
     }
 
-    fn read(&mut self, _req: &Request, _ino: u64, fh: u64, offset: i64, size: u32, _flags: i32, _lock: Option<u64>, reply: ReplyData) {
+    fn read(
+        &mut self,
+        _req: &Request,
+        _ino: u64,
+        fh: u64,
+        offset: i64,
+        size: u32,
+        _flags: i32,
+        _lock: Option<u64>,
+        reply: ReplyData,
+    ) {
         let sb = self.sb();
 
         let file_ino = {
             let files = self.open_files.lock().unwrap();
             match files.get(&fh) {
                 Some(f) => f.ino,
-                None => { reply.error(libc::EBADF); return; }
+                None => {
+                    reply.error(libc::EBADF);
+                    return;
+                }
             }
         };
 
         let inode = match self.fs.read_inode(file_ino, &sb) {
             Ok(i) => i,
-            Err(_) => { reply.error(libc::EIO); return; }
+            Err(_) => {
+                reply.error(libc::EIO);
+                return;
+            }
         };
 
         let mut buf = vec![0u8; size as usize];
@@ -436,20 +546,37 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         }
     }
 
-    fn write(&mut self, _req: &Request, _ino: u64, fh: u64, offset: i64, data: &[u8], _write_flags: u32, _flags: i32, _lock: Option<u64>, reply: ReplyWrite) {
+    fn write(
+        &mut self,
+        _req: &Request,
+        _ino: u64,
+        fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock: Option<u64>,
+        reply: ReplyWrite,
+    ) {
         let sb = self.sb();
 
         let file_ino = {
             let files = self.open_files.lock().unwrap();
             match files.get(&fh) {
                 Some(f) => f.ino,
-                None => { reply.error(libc::EBADF); return; }
+                None => {
+                    reply.error(libc::EBADF);
+                    return;
+                }
             }
         };
 
         let mut inode = match self.fs.read_inode(file_ino, &sb) {
             Ok(i) => i,
-            Err(_) => { reply.error(libc::EIO); return; }
+            Err(_) => {
+                reply.error(libc::EIO);
+                return;
+            }
         };
 
         match self.fs.write_file(&mut inode, offset as u64, data, &sb) {
@@ -464,17 +591,36 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         }
     }
 
-    fn release(&mut self, _req: &Request, _ino: u64, fh: u64, _flags: i32, _lock_owner: Option<u64>, _flush: bool, reply: ReplyEmpty) {
+    fn release(
+        &mut self,
+        _req: &Request,
+        _ino: u64,
+        fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
         self.open_files.lock().unwrap().remove(&fh);
         reply.ok();
     }
 
-    fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
+    fn readdir(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        mut reply: ReplyDirectory,
+    ) {
         let sb = self.sb();
 
         let inode = match self.fs.read_inode(ino, &sb) {
             Ok(i) => i,
-            Err(_) => { reply.error(libc::ENOENT); return; }
+            Err(_) => {
+                reply.error(libc::ENOENT);
+                return;
+            }
         };
 
         if !inode.is_dir() {
@@ -498,15 +644,17 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
 
             let mut pos = 0usize;
             while pos + 12 <= BLOCK_SIZE {
-                let entry_ino = u64::from_le_bytes(buf[pos..pos+8].try_into().unwrap());
-                let rec_len = u16::from_le_bytes(buf[pos+8..pos+10].try_into().unwrap());
-                let name_len = buf[pos+10] as usize;
-                let file_type = buf[pos+11];
+                let entry_ino = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
+                let rec_len = u16::from_le_bytes(buf[pos + 8..pos + 10].try_into().unwrap());
+                let name_len = buf[pos + 10] as usize;
+                let file_type = buf[pos + 11];
 
-                if rec_len == 0 { break; }
+                if rec_len == 0 {
+                    break;
+                }
 
                 if entry_ino != 0 {
-                    let name = std::str::from_utf8(&buf[pos+12..pos+12+name_len])
+                    let name = std::str::from_utf8(&buf[pos + 12..pos + 12 + name_len])
                         .unwrap_or("")
                         .to_string();
                     let kind = match file_type {

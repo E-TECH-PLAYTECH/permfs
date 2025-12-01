@@ -1,12 +1,15 @@
 // PermFS Distributed Lock Manager — Lease-based locking for cluster consistency
+#![cfg(feature = "std")]
 
-use crate::{BlockAddr, FsResult, IoError};
-use core::sync::atomic::{AtomicU64, AtomicU32, Ordering};
+use crate::{
+    sync::{Arc, Mutex, RwLock},
+    time::Clock,
+    BlockAddr, FsResult, IoError,
+};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 #[cfg(feature = "std")]
 use std::collections::HashMap;
-#[cfg(feature = "std")]
-use std::sync::{Arc, RwLock, Mutex};
 #[cfg(feature = "std")]
 use std::time::{Duration, Instant};
 
@@ -79,18 +82,18 @@ impl LockId {
 
 /// Lease duration in milliseconds
 pub const DEFAULT_LEASE_DURATION_MS: u64 = 30000; // 30 seconds
-pub const MIN_LEASE_DURATION_MS: u64 = 5000;      // 5 seconds
-pub const MAX_LEASE_DURATION_MS: u64 = 300000;    // 5 minutes
+pub const MIN_LEASE_DURATION_MS: u64 = 5000; // 5 seconds
+pub const MAX_LEASE_DURATION_MS: u64 = 300000; // 5 minutes
 
 /// Lock grant with lease information
 #[derive(Clone, Debug)]
 pub struct LockGrant {
     pub lock_id: LockId,
     pub mode: LockMode,
-    pub owner: u64,           // Node ID that owns the lock
-    pub sequence: u64,        // Monotonic sequence for fencing
-    pub lease_start: u64,     // Timestamp (ns) when lease started
-    pub lease_duration: u64,  // Lease duration in ns
+    pub owner: u64,          // Node ID that owns the lock
+    pub sequence: u64,       // Monotonic sequence for fencing
+    pub lease_start: u64,    // Timestamp (ns) when lease started
+    pub lease_duration: u64, // Lease duration in ns
 }
 
 impl LockGrant {
@@ -114,8 +117,8 @@ impl LockGrant {
 pub struct LockRequest {
     pub lock_id: LockId,
     pub mode: LockMode,
-    pub requester: u64,       // Node ID requesting lock
-    pub timeout_ns: u64,      // Max time to wait for lock
+    pub requester: u64,         // Node ID requesting lock
+    pub timeout_ns: u64,        // Max time to wait for lock
     pub lease_duration_ms: u64, // Requested lease duration
 }
 
@@ -258,14 +261,17 @@ impl LocalLockTable {
 
         // Lock not held - acquire it
         let seq = self.next_sequence();
-        locks.insert(request.lock_id, LockEntry {
-            mode: request.mode,
-            owner: request.requester,
-            sequence: seq,
-            lease_start: Instant::now(),
-            lease_duration: Duration::from_millis(request.lease_duration_ms),
-            waiters: Vec::new(),
-        });
+        locks.insert(
+            request.lock_id,
+            LockEntry {
+                mode: request.mode,
+                owner: request.requester,
+                sequence: seq,
+                lease_start: Instant::now(),
+                lease_duration: Duration::from_millis(request.lease_duration_ms),
+                waiters: Vec::new(),
+            },
+        );
 
         Ok(LockGrant {
             lock_id: request.lock_id,
@@ -297,7 +303,13 @@ impl LocalLockTable {
     }
 
     /// Renew a lease
-    pub fn renew(&self, lock_id: LockId, owner: u64, sequence: u64, new_duration_ms: u64) -> Result<LockGrant, LockError> {
+    pub fn renew(
+        &self,
+        lock_id: LockId,
+        owner: u64,
+        sequence: u64,
+        new_duration_ms: u64,
+    ) -> Result<LockGrant, LockError> {
         let mut locks = self.locks.write().unwrap();
 
         if let Some(entry) = locks.get_mut(&lock_id) {
@@ -328,7 +340,12 @@ impl LocalLockTable {
     }
 
     /// Upgrade a shared lock to exclusive
-    pub fn upgrade(&self, lock_id: LockId, owner: u64, sequence: u64) -> Result<LockGrant, LockError> {
+    pub fn upgrade(
+        &self,
+        lock_id: LockId,
+        owner: u64,
+        sequence: u64,
+    ) -> Result<LockGrant, LockError> {
         let mut locks = self.locks.write().unwrap();
 
         if let Some(entry) = locks.get_mut(&lock_id) {
@@ -447,7 +464,8 @@ impl DistributedLockManager {
 
     /// Release a lock
     pub fn release(&self, grant: &LockGrant) -> Result<(), LockError> {
-        self.local_table.release(grant.lock_id, grant.owner, grant.sequence)
+        self.local_table
+            .release(grant.lock_id, grant.owner, grant.sequence)
     }
 
     /// Renew a lease
@@ -464,7 +482,9 @@ impl DistributedLockManager {
 
     /// Upgrade a shared lock to exclusive
     pub fn upgrade(&self, grant: &LockGrant) -> Result<LockGrant, LockError> {
-        let mut new_grant = self.local_table.upgrade(grant.lock_id, grant.owner, grant.sequence)?;
+        let mut new_grant = self
+            .local_table
+            .upgrade(grant.lock_id, grant.owner, grant.sequence)?;
         new_grant.lease_start = crate::time::SystemClock::new().now_ns();
         Ok(new_grant)
     }
@@ -628,10 +648,15 @@ mod tests {
 
         // Can't acquire again
         let req2 = LockRequest::new(LockId::Inode(100), LockMode::Exclusive, 2);
-        assert!(matches!(table.try_acquire(&req2), Err(LockError::Contention)));
+        assert!(matches!(
+            table.try_acquire(&req2),
+            Err(LockError::Contention)
+        ));
 
         // Release
-        table.release(LockId::Inode(100), 1, grant.sequence).unwrap();
+        table
+            .release(LockId::Inode(100), 1, grant.sequence)
+            .unwrap();
 
         // Now can acquire
         let grant2 = table.try_acquire(&req2).unwrap();
@@ -663,8 +688,7 @@ mod tests {
         let _grant1 = dlm.acquire(&req1).unwrap();
 
         // Second acquire should timeout
-        let req2 = LockRequest::new(LockId::Inode(100), LockMode::Exclusive, 2)
-            .with_timeout(100); // 100ms timeout
+        let req2 = LockRequest::new(LockId::Inode(100), LockMode::Exclusive, 2).with_timeout(100); // 100ms timeout
         let start = std::time::Instant::now();
         let result = dlm.acquire(&req2);
         assert!(matches!(result, Err(LockError::Timeout)));

@@ -3,11 +3,11 @@
 
 #[cfg(feature = "network")]
 fn main() {
-    use permfs::transport::{TcpTransport, TcpServer, RequestHandler};
     use permfs::mock::MemoryBlockDevice;
-    use permfs::{BlockAddr, BlockDevice, AllocError, IoError, BLOCK_SIZE};
-    use std::sync::Arc;
+    use permfs::transport::{RequestHandler, TcpServer, TcpTransport};
+    use permfs::{AllocError, BlockAddr, BlockDevice, IoError, BLOCK_SIZE};
     use std::net::SocketAddr;
+    use std::sync::Arc;
 
     struct LocalHandler {
         device: MemoryBlockDevice,
@@ -37,7 +37,8 @@ fn main() {
     }
 
     let args: Vec<String> = std::env::args().collect();
-    let bind_addr: SocketAddr = args.get(1)
+    let bind_addr: SocketAddr = args
+        .get(1)
         .map(|s| s.parse().expect("Invalid address"))
         .unwrap_or_else(|| "127.0.0.1:7432".parse().unwrap());
 
@@ -49,11 +50,12 @@ fn main() {
     });
 
     let server = TcpServer::bind(1, bind_addr).expect("Failed to bind");
-    
+
     ctrlc::set_handler(move || {
         println!("\nShutting down...");
         std::process::exit(0);
-    }).expect("Error setting Ctrl+C handler");
+    })
+    .expect("Error setting Ctrl+C handler");
 
     println!("Server running. Press Ctrl+C to stop.");
     server.run(handler);

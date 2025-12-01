@@ -44,7 +44,7 @@ impl Extent {
 
     /// Check if this extent contains the given logical block
     pub fn contains(&self, logical_block: u64) -> bool {
-        logical_block >= self.logical_block 
+        logical_block >= self.logical_block
             && logical_block < self.logical_block + self.length as u64
     }
 
@@ -82,9 +82,9 @@ impl Extent {
 
 // Extent flags
 pub mod extent_flags {
-    pub const UNWRITTEN: u32 = 0x0001;  // Allocated but not written (hole)
+    pub const UNWRITTEN: u32 = 0x0001; // Allocated but not written (hole)
     pub const COMPRESSED: u32 = 0x0002; // Data is compressed
-    pub const ENCRYPTED: u32 = 0x0004;  // Data is encrypted
+    pub const ENCRYPTED: u32 = 0x0004; // Data is encrypted
 }
 
 // ============================================================================
@@ -255,9 +255,8 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
                 let entries_start = ExtentHeader::SIZE;
                 for i in 0..header.entries as usize {
                     let offset = entries_start + i * Extent::SIZE;
-                    let extent = Extent::from_bytes(
-                        buf[offset..offset + Extent::SIZE].try_into().unwrap()
-                    );
+                    let extent =
+                        Extent::from_bytes(buf[offset..offset + Extent::SIZE].try_into().unwrap());
 
                     if extent.contains(logical_block) {
                         return Ok(extent);
@@ -272,7 +271,7 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
                 for i in 0..header.entries as usize {
                     let offset = entries_start + i * ExtentIndex::SIZE;
                     let index = ExtentIndex::from_bytes(
-                        buf[offset..offset + ExtentIndex::SIZE].try_into().unwrap()
+                        buf[offset..offset + ExtentIndex::SIZE].try_into().unwrap(),
                     );
 
                     if logical_block >= index.logical_block {
@@ -299,7 +298,9 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
     ) -> FsResult<()> {
         if tree_root.is_null() {
             // Create new root leaf
-            let root = self.alloc_block(Some(volume_id)).map_err(|_| IoError::IoFailed)?;
+            let root = self
+                .alloc_block(Some(volume_id))
+                .map_err(|_| IoError::IoFailed)?;
             let mut buf = [0u8; BLOCK_SIZE];
 
             let mut header = ExtentHeader::new(max_leaf_entries(), 0);
@@ -316,29 +317,46 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
 
         // Find leaf and insert
         let result = self.extent_insert_recursive(*tree_root, extent, volume_id)?;
-        
+
         if let Some((new_extent, new_child)) = result {
             // Root split - create new root
-            let new_root = self.alloc_block(Some(volume_id)).map_err(|_| IoError::IoFailed)?;
+            let new_root = self
+                .alloc_block(Some(volume_id))
+                .map_err(|_| IoError::IoFailed)?;
             let mut buf = [0u8; BLOCK_SIZE];
 
             // Read old root to get its first key
             let mut old_buf = [0u8; BLOCK_SIZE];
             self.read_block(*tree_root, &mut old_buf)?;
-            let old_header = ExtentHeader::from_bytes(old_buf[0..ExtentHeader::SIZE].try_into().unwrap());
+            let old_header =
+                ExtentHeader::from_bytes(old_buf[0..ExtentHeader::SIZE].try_into().unwrap());
             let old_first_key = if old_header.is_leaf() {
-                let ext = Extent::from_bytes(old_buf[ExtentHeader::SIZE..ExtentHeader::SIZE + Extent::SIZE].try_into().unwrap());
+                let ext = Extent::from_bytes(
+                    old_buf[ExtentHeader::SIZE..ExtentHeader::SIZE + Extent::SIZE]
+                        .try_into()
+                        .unwrap(),
+                );
                 ext.logical_block
             } else {
-                let idx = ExtentIndex::from_bytes(old_buf[ExtentHeader::SIZE..ExtentHeader::SIZE + ExtentIndex::SIZE].try_into().unwrap());
+                let idx = ExtentIndex::from_bytes(
+                    old_buf[ExtentHeader::SIZE..ExtentHeader::SIZE + ExtentIndex::SIZE]
+                        .try_into()
+                        .unwrap(),
+                );
                 idx.logical_block
             };
 
             let mut header = ExtentHeader::new(max_index_entries(), old_header.depth + 1);
             header.entries = 2;
 
-            let idx0 = ExtentIndex { logical_block: old_first_key, child: *tree_root };
-            let idx1 = ExtentIndex { logical_block: new_extent.logical_block, child: new_child };
+            let idx0 = ExtentIndex {
+                logical_block: old_first_key,
+                child: *tree_root,
+            };
+            let idx1 = ExtentIndex {
+                logical_block: new_extent.logical_block,
+                child: new_child,
+            };
 
             buf[0..ExtentHeader::SIZE].copy_from_slice(&header.to_bytes());
             buf[ExtentHeader::SIZE..ExtentHeader::SIZE + ExtentIndex::SIZE]
@@ -380,7 +398,7 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         for i in 0..header.entries as usize {
             let offset = entries_start + i * ExtentIndex::SIZE;
             let index = ExtentIndex::from_bytes(
-                buf[offset..offset + ExtentIndex::SIZE].try_into().unwrap()
+                buf[offset..offset + ExtentIndex::SIZE].try_into().unwrap(),
             );
             if extent.logical_block >= index.logical_block {
                 child_idx = i;
@@ -391,14 +409,24 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
 
         let child_offset = entries_start + child_idx * ExtentIndex::SIZE;
         let child_index = ExtentIndex::from_bytes(
-            buf[child_offset..child_offset + ExtentIndex::SIZE].try_into().unwrap()
+            buf[child_offset..child_offset + ExtentIndex::SIZE]
+                .try_into()
+                .unwrap(),
         );
 
         let split_result = self.extent_insert_recursive(child_index.child, extent, volume_id)?;
 
         if let Some((split_key, split_child)) = split_result {
             // Child split - insert new index entry
-            return self.extent_insert_index(node, &mut buf, &mut header, split_key, split_child, child_idx + 1, volume_id);
+            return self.extent_insert_index(
+                node,
+                &mut buf,
+                &mut header,
+                split_key,
+                split_child,
+                child_idx + 1,
+                volume_id,
+            );
         }
 
         Ok(None)
@@ -418,7 +446,8 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         let mut insert_pos = header.entries as usize;
         for i in 0..header.entries as usize {
             let offset = entries_start + i * Extent::SIZE;
-            let existing = Extent::from_bytes(buf[offset..offset + Extent::SIZE].try_into().unwrap());
+            let existing =
+                Extent::from_bytes(buf[offset..offset + Extent::SIZE].try_into().unwrap());
             if extent.logical_block < existing.logical_block {
                 insert_pos = i;
                 break;
@@ -443,7 +472,9 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         }
 
         // Need to split
-        let new_node = self.alloc_block(Some(volume_id)).map_err(|_| IoError::IoFailed)?;
+        let new_node = self
+            .alloc_block(Some(volume_id))
+            .map_err(|_| IoError::IoFailed)?;
         let mut new_buf = [0u8; BLOCK_SIZE];
 
         let mid = header.entries as usize / 2;
@@ -453,7 +484,9 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         let mut all_extents = Vec::with_capacity(header.entries as usize + 1);
         for i in 0..header.entries as usize {
             let offset = entries_start + i * Extent::SIZE;
-            all_extents.push(Extent::from_bytes(buf[offset..offset + Extent::SIZE].try_into().unwrap()));
+            all_extents.push(Extent::from_bytes(
+                buf[offset..offset + Extent::SIZE].try_into().unwrap(),
+            ));
         }
         all_extents.insert(insert_pos, extent);
 
@@ -494,7 +527,10 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         volume_id: u32,
     ) -> FsResult<Option<(Extent, BlockAddr)>> {
         let entries_start = ExtentHeader::SIZE;
-        let new_index = ExtentIndex { logical_block: key.logical_block, child };
+        let new_index = ExtentIndex {
+            logical_block: key.logical_block,
+            child,
+        };
 
         if (header.entries as u16) < header.max_entries {
             // Room in this node
@@ -514,7 +550,9 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         }
 
         // Need to split internal node
-        let new_node = self.alloc_block(Some(volume_id)).map_err(|_| IoError::IoFailed)?;
+        let new_node = self
+            .alloc_block(Some(volume_id))
+            .map_err(|_| IoError::IoFailed)?;
         let mut new_buf = [0u8; BLOCK_SIZE];
 
         let mid = header.entries as usize / 2;
@@ -524,7 +562,9 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         let mut all_indices = Vec::with_capacity(header.entries as usize + 1);
         for i in 0..header.entries as usize {
             let offset = entries_start + i * ExtentIndex::SIZE;
-            all_indices.push(ExtentIndex::from_bytes(buf[offset..offset + ExtentIndex::SIZE].try_into().unwrap()));
+            all_indices.push(ExtentIndex::from_bytes(
+                buf[offset..offset + ExtentIndex::SIZE].try_into().unwrap(),
+            ));
         }
         all_indices.insert(insert_pos, new_index);
 
@@ -561,16 +601,18 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         }
 
         let removed = self.extent_remove_recursive(*tree_root, logical_block)?;
-        
+
         // Check if root is now empty index node
         let mut buf = [0u8; BLOCK_SIZE];
         self.read_block(*tree_root, &mut buf)?;
         let header = ExtentHeader::from_bytes(buf[0..ExtentHeader::SIZE].try_into().unwrap());
-        
+
         if !header.is_leaf() && header.entries == 1 {
             // Collapse root
             let idx = ExtentIndex::from_bytes(
-                buf[ExtentHeader::SIZE..ExtentHeader::SIZE + ExtentIndex::SIZE].try_into().unwrap()
+                buf[ExtentHeader::SIZE..ExtentHeader::SIZE + ExtentIndex::SIZE]
+                    .try_into()
+                    .unwrap(),
             );
             let old_root = *tree_root;
             *tree_root = idx.child;
@@ -599,7 +641,8 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
             // Find and remove from leaf
             for i in 0..header.entries as usize {
                 let offset = entries_start + i * Extent::SIZE;
-                let extent = Extent::from_bytes(buf[offset..offset + Extent::SIZE].try_into().unwrap());
+                let extent =
+                    Extent::from_bytes(buf[offset..offset + Extent::SIZE].try_into().unwrap());
 
                 if extent.contains(logical_block) {
                     // Remove by shifting
@@ -621,7 +664,9 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         let mut child_idx = 0;
         for i in 0..header.entries as usize {
             let offset = entries_start + i * ExtentIndex::SIZE;
-            let index = ExtentIndex::from_bytes(buf[offset..offset + ExtentIndex::SIZE].try_into().unwrap());
+            let index = ExtentIndex::from_bytes(
+                buf[offset..offset + ExtentIndex::SIZE].try_into().unwrap(),
+            );
             if logical_block >= index.logical_block {
                 child_idx = i;
             } else {
@@ -631,7 +676,9 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
 
         let child_offset = entries_start + child_idx * ExtentIndex::SIZE;
         let child_index = ExtentIndex::from_bytes(
-            buf[child_offset..child_offset + ExtentIndex::SIZE].try_into().unwrap()
+            buf[child_offset..child_offset + ExtentIndex::SIZE]
+                .try_into()
+                .unwrap(),
         );
 
         self.extent_remove_recursive(child_index.child, logical_block)
@@ -666,7 +713,8 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         if header.is_leaf() {
             for i in 0..header.entries as usize {
                 let offset = entries_start + i * Extent::SIZE;
-                let extent = Extent::from_bytes(buf[offset..offset + Extent::SIZE].try_into().unwrap());
+                let extent =
+                    Extent::from_bytes(buf[offset..offset + Extent::SIZE].try_into().unwrap());
                 if !callback(&extent) {
                     return Ok(());
                 }
@@ -674,7 +722,9 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         } else {
             for i in 0..header.entries as usize {
                 let offset = entries_start + i * ExtentIndex::SIZE;
-                let index = ExtentIndex::from_bytes(buf[offset..offset + ExtentIndex::SIZE].try_into().unwrap());
+                let index = ExtentIndex::from_bytes(
+                    buf[offset..offset + ExtentIndex::SIZE].try_into().unwrap(),
+                );
                 self.extent_iter_recursive(index.child, callback)?;
             }
         }
