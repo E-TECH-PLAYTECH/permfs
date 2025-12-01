@@ -4,12 +4,12 @@
 pub trait Clock: Send + Sync {
     /// Get current time in nanoseconds since Unix epoch
     fn now_ns(&self) -> u64;
-    
+
     /// Get current time in seconds since Unix epoch
     fn now_secs(&self) -> u64 {
         self.now_ns() / 1_000_000_000
     }
-    
+
     /// Get current time in milliseconds since Unix epoch
     fn now_ms(&self) -> u64 {
         self.now_ns() / 1_000_000
@@ -30,7 +30,7 @@ impl SystemClock {
         {
             Self {}
         }
-        
+
         #[cfg(not(feature = "std"))]
         {
             // For no_std, we'll use TSC or a provided base time
@@ -40,7 +40,7 @@ impl SystemClock {
             }
         }
     }
-    
+
     #[cfg(not(feature = "std"))]
     #[inline]
     fn read_tsc() -> u64 {
@@ -58,7 +58,7 @@ impl SystemClock {
             }
             ((hi as u64) << 32) | (lo as u64)
         }
-        
+
         #[cfg(target_arch = "x86")]
         {
             let lo: u32;
@@ -73,7 +73,7 @@ impl SystemClock {
             }
             ((hi as u64) << 32) | (lo as u64)
         }
-        
+
         #[cfg(target_arch = "aarch64")]
         {
             let cnt: u64;
@@ -86,14 +86,14 @@ impl SystemClock {
             }
             cnt
         }
-        
+
         #[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))]
         {
             // Fallback: return 0, caller should provide clock
             0
         }
     }
-    
+
     #[cfg(not(feature = "std"))]
     fn estimate_tsc_freq() -> u64 {
         // Default assumption: 2.5 GHz
@@ -118,9 +118,13 @@ impl Clock for SystemClock {
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0)
         }
-        
+
         #[cfg(not(feature = "std"))]
         {
+            if let Some(ns) = crate::os_porting::monotonic_now_ns() {
+                return ns;
+            }
+
             let current_tsc = Self::read_tsc();
             let elapsed_ticks = current_tsc.saturating_sub(self.base_tsc);
             // Convert TSC ticks to nanoseconds
@@ -147,7 +151,7 @@ pub struct MonotonicClock {
 #[cfg(feature = "std")]
 impl MonotonicClock {
     pub fn new() -> Self {
-        use std::time::{SystemTime, UNIX_EPOCH, Instant};
+        use std::time::{Instant, SystemTime, UNIX_EPOCH};
         let epoch_offset_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -185,13 +189,15 @@ impl ManualClock {
             current_ns: core::sync::atomic::AtomicU64::new(initial_ns),
         }
     }
-    
+
     pub fn set(&self, ns: u64) {
-        self.current_ns.store(ns, core::sync::atomic::Ordering::SeqCst);
+        self.current_ns
+            .store(ns, core::sync::atomic::Ordering::SeqCst);
     }
-    
+
     pub fn advance(&self, ns: u64) {
-        self.current_ns.fetch_add(ns, core::sync::atomic::Ordering::SeqCst);
+        self.current_ns
+            .fetch_add(ns, core::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -210,7 +216,8 @@ pub fn ns_to_timespec(ns: u64) -> (u64, u32) {
 
 /// Convert (secs, nsecs) to nanoseconds
 pub fn timespec_to_ns(secs: u64, nsecs: u32) -> u64 {
-    secs.saturating_mul(1_000_000_000).saturating_add(nsecs as u64)
+    secs.saturating_mul(1_000_000_000)
+        .saturating_add(nsecs as u64)
 }
 
 #[cfg(test)]
@@ -222,7 +229,9 @@ mod tests {
         let clock = SystemClock::new();
         let t1 = clock.now_ns();
         // Small busy wait
-        for _ in 0..10000 { core::hint::spin_loop(); }
+        for _ in 0..10000 {
+            core::hint::spin_loop();
+        }
         let t2 = clock.now_ns();
         assert!(t2 >= t1, "Time should not go backwards");
     }
