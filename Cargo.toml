@@ -21,6 +21,7 @@ kernel = []
 os_porting = ["alloc"]
 fuse = ["std", "dep:fuser", "dep:nix"]
 network = ["std", "dep:socket2", "dep:parking_lot"]
+block-discard = ["std"]
 
 [dependencies]
 bitflags = { version = "2.4", default-features = false }
