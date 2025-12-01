@@ -29,6 +29,8 @@ pub mod mkfs;
 pub mod ops;
 pub mod extent;
 pub mod dlm;
+#[cfg(feature = "std")]
+pub mod drivers;
 
 #[cfg(feature = "std")]
 pub mod vfs;
@@ -42,6 +44,8 @@ pub mod fuse;
 // Re-exports
 pub use time::Clock;
 pub use checksum::{crc32c, verify_checksum, compute_inode_checksum, compute_superblock_checksum};
+#[cfg(feature = "std")]
+pub use drivers::block_device::{BlockDeviceParams, ChecksumHook, OsBlockDevice};
 
 // ============================================================================
 // 256-BIT BLOCK ADDRESSING
