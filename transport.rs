@@ -19,6 +19,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const PROTOCOL_MAGIC: u32 = 0x50464E54; // "PFNT"
 pub const DEFAULT_PORT: u16 = 7432;
 pub const MAX_MESSAGE_SIZE: usize = BLOCK_SIZE + 256;
+const MAX_WIRE_SIZE: usize = MAX_MESSAGE_SIZE + MessageHeader::SIZE;
 pub const CONNECTION_TIMEOUT_MS: u64 = 5000;
 pub const READ_TIMEOUT_MS: u64 = 10000;
 pub const WRITE_TIMEOUT_MS: u64 = 10000;
@@ -342,6 +343,13 @@ impl TcpTransport {
         header: &MessageHeader,
         payload: &[u8],
     ) -> Result<TcpStream, IoError> {
+        if payload.len() + MessageHeader::SIZE > MAX_WIRE_SIZE {
+            return Err(IoError::Corrupted);
+        }
+        if header.payload_len as usize != payload.len() {
+            return Err(IoError::Corrupted);
+        }
+
         let mut stream = self.connect(node_id)?;
 
         let header_bytes = header.to_bytes();
@@ -369,12 +377,30 @@ impl TcpTransport {
             return Err(IoError::Corrupted);
         }
 
-        let mut payload = vec![0u8; header.payload_len as usize];
-        if header.payload_len > 0 {
-            stream
-                .read_exact(&mut payload)
-                .map_err(|_| IoError::NetworkTimeout)?;
+        let payload_len = header.payload_len as usize;
+        let msg_type = MessageType::from_u16(header.msg_type);
+        if payload_len + MessageHeader::SIZE > MAX_WIRE_SIZE {
+            return Err(IoError::Corrupted);
         }
+        if payload_len == 0
+            && matches!(
+                msg_type,
+                Some(MessageType::ReadReply) | Some(MessageType::AllocReply)
+            )
+        {
+            return Err(IoError::Corrupted);
+        }
+
+        let mut fixed_buf = [0u8; MAX_MESSAGE_SIZE];
+        let payload = if payload_len > 0 {
+            let slice = &mut fixed_buf[..payload_len];
+            stream
+                .read_exact(slice)
+                .map_err(|_| IoError::NetworkTimeout)?;
+            slice.to_vec()
+        } else {
+            Vec::new()
+        };
 
         Ok((header, payload))
     }
@@ -602,15 +628,46 @@ impl TcpServer {
                 break;
             }
 
-            // Read payload
-            let mut payload = vec![0u8; header.payload_len as usize];
-            if header.payload_len > 0 && stream.read_exact(&mut payload).is_err() {
+            let msg_type = match MessageType::from_u16(header.msg_type) {
+                Some(mt) => mt,
+                None => break,
+            };
+
+            let payload_len = header.payload_len as usize;
+            if payload_len + MessageHeader::SIZE > MAX_WIRE_SIZE {
                 break;
             }
 
+            let requires_payload = matches!(
+                msg_type,
+                MessageType::ReadBlock
+                    | MessageType::WriteBlock
+                    | MessageType::AllocBlock
+                    | MessageType::FreeBlock
+            );
+            if payload_len == 0 && requires_payload {
+                let resp_header =
+                    MessageHeader::new(MessageType::Error, local_node_id, header.source_node, 0);
+                let _ = stream.write_all(&resp_header.to_bytes());
+                let _ = stream.flush();
+                continue;
+            }
+
+            // Read payload
+            let mut payload_buf = [0u8; MAX_MESSAGE_SIZE];
+            if payload_len > 0 {
+                if stream
+                    .read_exact(&mut payload_buf[..payload_len])
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let payload = &payload_buf[..payload_len];
+
             // Process request
-            let (resp_type, resp_payload) = match MessageType::from_u16(header.msg_type) {
-                Some(MessageType::ReadBlock) => {
+            let (resp_type, resp_payload) = match msg_type {
+                MessageType::ReadBlock => {
                     if payload.len() != 32 {
                         (MessageType::Error, Vec::new())
                     } else {
@@ -621,7 +678,7 @@ impl TcpServer {
                         }
                     }
                 }
-                Some(MessageType::WriteBlock) => {
+                MessageType::WriteBlock => {
                     if payload.len() != 32 + BLOCK_SIZE {
                         (MessageType::Error, Vec::new())
                     } else {
@@ -633,7 +690,7 @@ impl TcpServer {
                         }
                     }
                 }
-                Some(MessageType::AllocBlock) => {
+                MessageType::AllocBlock => {
                     if payload.len() != 4 {
                         (MessageType::Error, Vec::new())
                     } else {
@@ -644,7 +701,7 @@ impl TcpServer {
                         }
                     }
                 }
-                Some(MessageType::FreeBlock) => {
+                MessageType::FreeBlock => {
                     if payload.len() != 32 {
                         (MessageType::Error, Vec::new())
                     } else {
@@ -655,7 +712,7 @@ impl TcpServer {
                         }
                     }
                 }
-                Some(MessageType::Ping) => (MessageType::Pong, Vec::new()),
+                MessageType::Ping => (MessageType::Pong, Vec::new()),
                 _ => (MessageType::Error, Vec::new()),
             };
 
@@ -687,6 +744,37 @@ impl TcpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Default)]
+    struct CountingHandler {
+        read_calls: AtomicUsize,
+        write_calls: AtomicUsize,
+        alloc_calls: AtomicUsize,
+        free_calls: AtomicUsize,
+    }
+
+    impl RequestHandler for CountingHandler {
+        fn handle_read(&self, _addr: BlockAddr) -> Result<[u8; BLOCK_SIZE], IoError> {
+            self.read_calls.fetch_add(1, Ordering::SeqCst);
+            Ok([0u8; BLOCK_SIZE])
+        }
+
+        fn handle_write(&self, _addr: BlockAddr, _data: &[u8; BLOCK_SIZE]) -> Result<(), IoError> {
+            self.write_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn handle_alloc(&self, _volume: u32) -> Result<BlockAddr, AllocError> {
+            self.alloc_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(BlockAddr::NULL)
+        }
+
+        fn handle_free(&self, _addr: BlockAddr) -> Result<(), AllocError> {
+            self.free_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_message_header_roundtrip() {
@@ -694,11 +782,17 @@ mod tests {
         let bytes = header.to_bytes();
         let recovered = MessageHeader::from_bytes(&bytes);
 
-        assert_eq!(header.magic, recovered.magic);
-        assert_eq!(header.msg_type, recovered.msg_type);
-        assert_eq!(header.source_node, recovered.source_node);
-        assert_eq!(header.dest_node, recovered.dest_node);
-        assert_eq!(header.payload_len, recovered.payload_len);
+        let header_magic = header.magic;
+        let header_msg = header.msg_type;
+        let header_source = header.source_node;
+        let header_dest = header.dest_node;
+        let header_payload = header.payload_len;
+
+        assert_eq!(header_magic, recovered.magic);
+        assert_eq!(header_msg, recovered.msg_type);
+        assert_eq!(header_source, recovered.source_node);
+        assert_eq!(header_dest, recovered.dest_node);
+        assert_eq!(header_payload, recovered.payload_len);
     }
 
     #[test]
@@ -718,5 +812,91 @@ mod tests {
         let healthy = registry.all_healthy();
         assert_eq!(healthy.len(), 1);
         assert_eq!(healthy[0].node_id, 3);
+    }
+
+    #[test]
+    fn server_rejects_oversized_payload() {
+        let handler = Arc::new(CountingHandler::default());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = {
+            let handler = Arc::clone(&handler);
+            std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                TcpServer::handle_connection(1, stream, handler);
+            })
+        };
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        let header = MessageHeader::new(
+            MessageType::WriteBlock,
+            2,
+            1,
+            (MAX_MESSAGE_SIZE as u32) + 1,
+        );
+        client.write_all(&header.to_bytes()).unwrap();
+        client.flush().unwrap();
+
+        drop(client);
+        server.join().unwrap();
+
+        assert_eq!(handler.write_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn server_rejects_zero_length_payload_for_write() {
+        let handler = Arc::new(CountingHandler::default());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = {
+            let handler = Arc::clone(&handler);
+            std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                TcpServer::handle_connection(10, stream, handler);
+            })
+        };
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        let header = MessageHeader::new(MessageType::WriteBlock, 20, 10, 0);
+        client.write_all(&header.to_bytes()).unwrap();
+        client.flush().unwrap();
+
+        let mut resp_header_buf = [0u8; MessageHeader::SIZE];
+        client.read_exact(&mut resp_header_buf).unwrap();
+        let resp_header = MessageHeader::from_bytes(&resp_header_buf);
+
+        drop(client);
+        server.join().unwrap();
+
+        let resp_msg_type = resp_header.msg_type;
+        assert_eq!(resp_msg_type, MessageType::Error as u16);
+        assert_eq!(handler.write_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn client_rejects_oversized_response_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let header = MessageHeader::new(
+                MessageType::ReadReply,
+                1,
+                2,
+                (MAX_MESSAGE_SIZE as u32) + 1,
+            );
+            stream.write_all(&header.to_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let transport = TcpTransport::new(2);
+        let mut client_stream = TcpStream::connect(addr).unwrap();
+        let result = transport.recv_response(&mut client_stream);
+
+        server.join().unwrap();
+        assert!(matches!(result, Err(IoError::Corrupted)));
     }
 }
