@@ -337,6 +337,23 @@ fn auth_overhead(flags: u16) -> usize {
     }
 }
 
+fn validate_payload_size(payload_len: usize, flags: u16) -> Result<(), IoError> {
+    if payload_len > MAX_MESSAGE_SIZE {
+        return Err(IoError::Corrupted);
+    }
+
+    let total = MessageHeader::SIZE
+        .checked_add(payload_len)
+        .and_then(|v| v.checked_add(auth_overhead(flags)))
+        .ok_or(IoError::Corrupted)?;
+
+    if total > MAX_WIRE_SIZE {
+        return Err(IoError::Corrupted);
+    }
+
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SessionKeys {
     mac_key: [u8; 32],
@@ -352,6 +369,7 @@ impl SessionKeys {
 struct SecureStream {
     stream: TcpStream,
     session: Option<SessionKeys>,
+    peer_id: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -506,6 +524,7 @@ impl ConnectionPool {
                         return Some(SecureStream {
                             stream,
                             session: conn.session.clone(),
+                            peer_id: Some(conn.peer_id),
                         });
                     }
                 }
@@ -524,7 +543,7 @@ impl ConnectionPool {
         if conns.len() < self.max_per_node {
             conns.push(PooledConnection {
                 stream: stream.stream,
-                peer_id: node_id,
+                peer_id: stream.peer_id.unwrap_or(node_id),
                 session: stream.session,
                 last_used: std::time::Instant::now(),
             });
@@ -682,6 +701,7 @@ impl TcpTransport {
             return Ok(SecureStream {
                 stream,
                 session: None,
+                peer_id: None,
             });
         }
 
@@ -693,6 +713,7 @@ impl TcpTransport {
                     return Ok(SecureStream {
                         stream,
                         session: Some(session),
+                        peer_id: Some(node_id),
                     });
                 }
             }
@@ -707,14 +728,16 @@ impl TcpTransport {
         header: &mut MessageHeader,
         payload: &[u8],
     ) -> Result<SecureStream, IoError> {
-        if payload.len() > MAX_MESSAGE_SIZE {
-            return Err(IoError::Corrupted);
-        }
-        if header.payload_len as usize != payload.len() {
+        if payload.len() > MAX_MESSAGE_SIZE || header.payload_len as usize != payload.len() {
             return Err(IoError::Corrupted);
         }
 
         let mut stream = self.connect(node_id)?;
+        if let Some(peer) = stream.peer_id {
+            if peer != node_id || header.dest_node != node_id {
+                return Err(IoError::PermissionDenied);
+            }
+        }
 
         if stream.session.is_some() {
             header.flags |= FLAG_AUTHENTICATED;
@@ -722,10 +745,7 @@ impl TcpTransport {
             return Err(IoError::PermissionDenied);
         }
 
-        let total_wire = MessageHeader::SIZE + payload.len() + auth_overhead(header.flags);
-        if total_wire > MAX_WIRE_SIZE {
-            return Err(IoError::Corrupted);
-        }
+        validate_payload_size(payload.len(), header.flags)?;
 
         let header_bytes = header.to_bytes();
         stream
@@ -771,13 +791,15 @@ impl TcpTransport {
         if header.source_node != expected_source || header.dest_node != self.local_node_id {
             return Err(IoError::PermissionDenied);
         }
+        if let Some(peer) = stream.peer_id {
+            if peer != header.source_node {
+                return Err(IoError::PermissionDenied);
+            }
+        }
 
         let payload_len = header.payload_len as usize;
         let msg_type = MessageType::from_u16(header.msg_type).ok_or(IoError::Corrupted)?;
-        let total_wire = MessageHeader::SIZE + payload_len + auth_overhead(header.flags);
-        if payload_len > MAX_MESSAGE_SIZE || total_wire > MAX_WIRE_SIZE {
-            return Err(IoError::Corrupted);
-        }
+        validate_payload_size(payload_len, header.flags)?;
         if let Some(expected_len) = msg_type.expected_response_len() {
             if payload_len != expected_len {
                 return Err(IoError::Corrupted);
@@ -811,7 +833,7 @@ impl TcpTransport {
             if tag != expected {
                 return Err(IoError::PermissionDenied);
             }
-        } else if !self.allow_insecure {
+        } else if stream.session.is_some() || !self.allow_insecure {
             return Err(IoError::PermissionDenied);
         }
 
@@ -1065,6 +1087,28 @@ impl TcpServer {
                 Err(_) => return,
             };
 
+        let mut send_error_response = |dest_node: u64, session: Option<&SessionKeys>| {
+            let mut resp_header =
+                MessageHeader::new(MessageType::Error, local_node_id, dest_node, 0);
+            if session.is_some() {
+                resp_header.flags |= FLAG_AUTHENTICATED;
+            }
+            let resp_bytes = resp_header.to_bytes();
+            if stream.write_all(&resp_bytes).is_err() {
+                return false;
+            }
+            if let Some(keys) = session {
+                if let Ok(tag) = TcpTransport::compute_message_mac(keys, &resp_bytes, &[]) {
+                    if stream.write_all(&tag).is_err() {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+            stream.flush().is_ok()
+        };
+
         loop {
             // Read header
             let mut header_buf = [0u8; MessageHeader::SIZE];
@@ -1079,14 +1123,7 @@ impl TcpServer {
 
             if let Some(peer) = authenticated_peer {
                 if header.source_node != peer || header.dest_node != local_node_id {
-                    let resp_header = MessageHeader::new(
-                        MessageType::Error,
-                        local_node_id,
-                        header.source_node,
-                        0,
-                    );
-                    let _ = stream.write_all(&resp_header.to_bytes());
-                    let _ = stream.flush();
+                    let _ = send_error_response(header.source_node, session.as_ref());
                     break;
                 }
             } else if !allow_insecure {
@@ -1099,23 +1136,14 @@ impl TcpServer {
             };
 
             let payload_len = header.payload_len as usize;
-            let total_wire = MessageHeader::SIZE + payload_len + auth_overhead(header.flags);
-            if payload_len > MAX_MESSAGE_SIZE || total_wire > MAX_WIRE_SIZE {
+            if validate_payload_size(payload_len, header.flags).is_err()
+                || msg_type
+                    .expected_request_len()
+                    .map(|expected| expected != payload_len)
+                    .unwrap_or(false)
+            {
+                let _ = send_error_response(header.source_node, session.as_ref());
                 break;
-            }
-
-            if let Some(expected_len) = msg_type.expected_request_len() {
-                if payload_len != expected_len {
-                    let resp_header = MessageHeader::new(
-                        MessageType::Error,
-                        local_node_id,
-                        header.source_node,
-                        0,
-                    );
-                    let _ = stream.write_all(&resp_header.to_bytes());
-                    let _ = stream.flush();
-                    break;
-                }
             }
 
             // Read payload
@@ -1142,7 +1170,7 @@ impl TcpServer {
                 } else {
                     break;
                 }
-            } else if !allow_insecure {
+            } else if session.is_some() || !allow_insecure {
                 break;
             }
 
@@ -1455,9 +1483,21 @@ mod tests {
         client.write_all(&header.to_bytes()).unwrap();
         client.flush().unwrap();
 
+        let mut resp_header_buf = [0u8; MessageHeader::SIZE];
+        let read_result = client.read_exact(&mut resp_header_buf);
+        let mut auth_tag = [0u8; AUTH_TAG_SIZE];
+        let mut tag_result = Ok(());
+        let resp_header = MessageHeader::from_bytes(&resp_header_buf);
+        if read_result.is_ok() && (resp_header.flags & FLAG_AUTHENTICATED) != 0 {
+            tag_result = client.read_exact(&mut auth_tag);
+        }
+
         drop(client);
         server.join().unwrap();
 
+        assert!(read_result.is_ok());
+        assert!(tag_result.is_ok());
+        assert_eq!(resp_header.msg_type, MessageType::Error as u16);
         assert_eq!(handler.write_calls.load(Ordering::SeqCst), 0);
     }
 
@@ -1487,6 +1527,10 @@ mod tests {
         let mut resp_header_buf = [0u8; MessageHeader::SIZE];
         client.read_exact(&mut resp_header_buf).unwrap();
         let resp_header = MessageHeader::from_bytes(&resp_header_buf);
+        if (resp_header.flags & FLAG_AUTHENTICATED) != 0 {
+            let mut tag = [0u8; AUTH_TAG_SIZE];
+            client.read_exact(&mut tag).unwrap();
+        }
 
         drop(client);
         server.join().unwrap();
@@ -1513,6 +1557,7 @@ mod tests {
         let mut client_stream = SecureStream {
             stream: TcpStream::connect(addr).unwrap(),
             session: None,
+            peer_id: None,
         };
         let result = transport.recv_response(&mut client_stream, 1);
 
@@ -1619,6 +1664,48 @@ mod tests {
     }
 
     #[test]
+    fn server_rejects_handshake_with_wrong_destination_node() {
+        let handler = Arc::new(CountingHandler::default());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let registry = Arc::new(NodeRegistry::new(50));
+        registry.register(60, addr, test_auth_config());
+
+        let server = {
+            let handler = Arc::clone(&handler);
+            let registry = Arc::clone(&registry);
+            std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                TcpServer::handle_connection(50, registry, stream, handler, false);
+            })
+        };
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        let mut nonce = [0u8; HANDSHAKE_NONCE_SIZE];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let mut req = HandshakeRequest {
+            source_node: 60,
+            dest_node: 9999,
+            key_id: TEST_KEY_ID,
+            nonce,
+            mac: [0u8; 32],
+        };
+        req.mac = compute_mac(TEST_SECRET, &req.signing_data()).unwrap();
+
+        let write_result = client.write_all(&req.to_bytes());
+        let mut resp_buf = [0u8; HandshakeResponse::SIZE];
+        let read_result = client.read_exact(&mut resp_buf);
+
+        drop(client);
+        server.join().unwrap();
+
+        assert!(write_result.is_ok());
+        assert!(read_result.is_err());
+        assert_eq!(handler.read_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(handler.write_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn tampered_auth_tag_is_rejected_before_handler() {
         let handler = Arc::new(CountingHandler::default());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1691,11 +1778,39 @@ mod tests {
 
         let mut resp_buf = [0u8; MessageHeader::SIZE];
         let resp_result = client.read_exact(&mut resp_buf);
+        let resp_header = MessageHeader::from_bytes(&resp_buf);
+        if resp_result.is_ok() && (resp_header.flags & FLAG_AUTHENTICATED) != 0 {
+            let mut tag = [0u8; AUTH_TAG_SIZE];
+            let _ = client.read_exact(&mut tag);
+        }
 
         server.join().unwrap();
         assert!(resp_result.is_ok());
-        let resp_header = MessageHeader::from_bytes(&resp_buf);
         assert_eq!(resp_header.msg_type, MessageType::Error as u16);
         assert_eq!(handler.write_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn client_rejects_response_from_unexpected_peer_identity() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let header = MessageHeader::new(MessageType::Pong, 42, 99, 0);
+            stream.write_all(&header.to_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let transport = TcpTransport::new_insecure(99);
+        let mut client_stream = SecureStream {
+            stream: TcpStream::connect(addr).unwrap(),
+            session: None,
+            peer_id: Some(7),
+        };
+        let result = transport.recv_response(&mut client_stream, 42);
+
+        server.join().unwrap();
+        assert!(matches!(result, Err(IoError::PermissionDenied)));
     }
 }

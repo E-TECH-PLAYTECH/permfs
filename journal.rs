@@ -75,6 +75,7 @@ mod tests {
         buf[0] = record.kind as u8;
         buf[1..33].copy_from_slice(&record.addr.to_bytes());
         buf[33..37].copy_from_slice(&record.count.to_le_bytes());
+        buf[37..40].fill(0);
         buf[40..48].copy_from_slice(&record.timestamp.to_le_bytes());
         buf
     }
