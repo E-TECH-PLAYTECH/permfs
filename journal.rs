@@ -35,6 +35,7 @@ impl AllocationRecord {
     pub const SIZE: usize = 48;
 
     pub fn serialize(&self, buf: &mut [u8]) {
+        buf.fill(0);
         buf[0] = self.kind as u8;
         buf[1..33].copy_from_slice(&self.addr.to_bytes());
         buf[33..37].copy_from_slice(&self.count.to_le_bytes());
@@ -63,6 +64,54 @@ impl AllocationRecord {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn expected_bytes(record: &AllocationRecord) -> [u8; AllocationRecord::SIZE] {
+        let mut buf = [0u8; AllocationRecord::SIZE];
+        buf[0] = record.kind as u8;
+        buf[1..33].copy_from_slice(&record.addr.to_bytes());
+        buf[33..37].copy_from_slice(&record.count.to_le_bytes());
+        buf[40..48].copy_from_slice(&record.timestamp.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn allocation_record_serialization_is_stable_from_dirty_buffers() {
+        let record_a = AllocationRecord {
+            kind: AllocationRecordKind::Allocation,
+            addr: BlockAddr::new(1, 2, 3, 4),
+            count: 5,
+            timestamp: 0x1122_3344_5566_7788,
+        };
+        let record_b = AllocationRecord {
+            kind: AllocationRecordKind::Free,
+            addr: BlockAddr::new(9, 10, 11, 12),
+            count: 1024,
+            timestamp: 0x8877_6655_4433_2211,
+        };
+
+        let expected_a = expected_bytes(&record_a);
+        let expected_b = expected_bytes(&record_b);
+
+        // Start with a dirty buffer and ensure serialization overwrites every byte.
+        let mut buf = [0xAA; AllocationRecord::SIZE];
+        record_a.serialize(&mut buf);
+        assert_eq!(buf, expected_a);
+
+        // Reuse the same non-zeroed buffer for a second record to verify determinism.
+        record_b.serialize(&mut buf);
+        assert_eq!(buf, expected_b);
+        assert!(buf[37..40].iter().all(|&b| b == 0));
+        assert_eq!(AllocationRecord::deserialize(&buf), record_b);
+
+        // Serializing into another dirty buffer should yield the same bytes.
+        let mut other_buf = [0xCC; AllocationRecord::SIZE];
+        record_b.serialize(&mut other_buf);
+        assert_eq!(other_buf, expected_b);
+    }
+}
 /// Journal superblock
 #[repr(C)]
 #[derive(Clone, Copy)]
