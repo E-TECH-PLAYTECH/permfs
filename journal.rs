@@ -35,6 +35,9 @@ impl AllocationRecord {
     pub const SIZE: usize = 48;
 
     pub fn serialize(&self, buf: &mut [u8]) {
+        assert!(buf.len() >= Self::SIZE);
+
+        let buf = &mut buf[..Self::SIZE];
         buf.fill(0);
         buf[0] = self.kind as u8;
         buf[1..33].copy_from_slice(&self.addr.to_bytes());
@@ -205,6 +208,9 @@ impl TxDescriptor {
     pub const SIZE: usize = 48;
 
     pub fn serialize(&self, buf: &mut [u8]) {
+        assert!(buf.len() >= Self::SIZE);
+
+        let buf = &mut buf[..Self::SIZE];
         buf.fill(0);
         buf[0..8].copy_from_slice(&self.magic.to_le_bytes());
         buf[8..16].copy_from_slice(&self.seq.to_le_bytes());
