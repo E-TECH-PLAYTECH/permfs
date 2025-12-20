@@ -39,6 +39,8 @@ impl AllocationRecord {
         buf[0] = self.kind as u8;
         buf[1..33].copy_from_slice(&self.addr.to_bytes());
         buf[33..37].copy_from_slice(&self.count.to_le_bytes());
+        // Ensure the previously unused padding bytes are stable for checksum calculations.
+        buf[37..40].fill(0);
         buf[40..48].copy_from_slice(&self.timestamp.to_le_bytes());
     }
 
@@ -111,6 +113,29 @@ mod tests {
         record_b.serialize(&mut other_buf);
         assert_eq!(other_buf, expected_b);
     }
+
+    #[test]
+    fn tx_descriptor_zero_fills_padding_and_is_deterministic() {
+        let descriptor = TxDescriptor {
+            magic: JOURNAL_MAGIC,
+            seq: 42,
+            state: TxState::Running,
+            block_count: 3,
+            record_count: 2,
+            timestamp: 0xCAFEBABE_DEADBEEF,
+            checksum: 0x1234_5678_9ABC_DEF0,
+        };
+
+        let mut dirty = [0xFF; TxDescriptor::SIZE];
+        descriptor.serialize(&mut dirty);
+
+        let mut expected = [0u8; TxDescriptor::SIZE];
+        descriptor.serialize(&mut expected);
+
+        assert_eq!(dirty, expected);
+        assert!(dirty[28..32].iter().all(|&b| b == 0));
+        assert_eq!(TxDescriptor::deserialize(&dirty), descriptor);
+    }
 }
 /// Journal superblock
 #[repr(C)]
@@ -179,11 +204,13 @@ impl TxDescriptor {
     pub const SIZE: usize = 48;
 
     pub fn serialize(&self, buf: &mut [u8]) {
+        buf.fill(0);
         buf[0..8].copy_from_slice(&self.magic.to_le_bytes());
         buf[8..16].copy_from_slice(&self.seq.to_le_bytes());
         buf[16..20].copy_from_slice(&(self.state as u32).to_le_bytes());
         buf[20..24].copy_from_slice(&self.block_count.to_le_bytes());
         buf[24..28].copy_from_slice(&self.record_count.to_le_bytes());
+        buf[28..32].fill(0);
         buf[32..40].copy_from_slice(&self.timestamp.to_le_bytes());
         buf[40..48].copy_from_slice(&self.checksum.to_le_bytes());
     }
