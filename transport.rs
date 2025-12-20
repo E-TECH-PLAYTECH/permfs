@@ -576,6 +576,10 @@ impl TcpTransport {
 
     #[cfg(any(feature = "insecure-transport", test))]
     pub fn new_insecure(local_node_id: u64) -> Self {
+        debug_assert!(
+            cfg!(feature = "insecure-transport") || cfg!(test),
+            "insecure transport requires explicit opt-in feature"
+        );
         Self::with_security(local_node_id, true)
     }
 
@@ -728,8 +732,14 @@ impl TcpTransport {
         header: &mut MessageHeader,
         payload: &[u8],
     ) -> Result<SecureStream, IoError> {
+        let msg_type = MessageType::from_u16(header.msg_type).ok_or(IoError::Corrupted)?;
         if payload.len() > MAX_MESSAGE_SIZE || header.payload_len as usize != payload.len() {
             return Err(IoError::Corrupted);
+        }
+        if let Some(expected_len) = msg_type.expected_request_len() {
+            if payload.len() != expected_len {
+                return Err(IoError::Corrupted);
+            }
         }
 
         let mut stream = self.connect(node_id)?;
@@ -737,6 +747,10 @@ impl TcpTransport {
             if peer != node_id || header.dest_node != node_id {
                 return Err(IoError::PermissionDenied);
             }
+        }
+
+        if header.source_node != self.local_node_id || header.dest_node != node_id {
+            return Err(IoError::PermissionDenied);
         }
 
         if stream.session.is_some() {
@@ -1422,6 +1436,39 @@ mod tests {
     }
 
     #[test]
+    fn client_rejects_handshake_with_wrong_server_identity() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut req_buf = [0u8; HandshakeRequest::SIZE];
+            stream.read_exact(&mut req_buf).unwrap();
+            let req = HandshakeRequest::from_bytes(&req_buf).unwrap();
+
+            let mut response = HandshakeResponse {
+                server_node: 9999, // Deliberately incorrect
+                client_node: req.source_node,
+                key_id: req.key_id,
+                client_nonce: req.nonce,
+                server_nonce: [7u8; HANDSHAKE_NONCE_SIZE],
+                mac: [0u8; 32],
+            };
+            response.mac = compute_mac(TEST_SECRET, &response.signing_data()).unwrap();
+            stream.write_all(&response.to_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let transport = TcpTransport::new(10);
+        transport.registry().register(5, addr, test_auth_config());
+
+        let result = transport.connect(5);
+
+        server.join().unwrap();
+        assert!(matches!(result, Err(IoError::PermissionDenied)));
+    }
+
+    #[test]
     fn test_message_header_roundtrip() {
         let header = MessageHeader::new(MessageType::ReadBlock, 123, 456, 100);
         let bytes = header.to_bytes();
@@ -1499,6 +1546,55 @@ mod tests {
         assert!(tag_result.is_ok());
         assert_eq!(resp_header.msg_type, MessageType::Error as u16);
         assert_eq!(handler.write_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn client_rejects_nonzero_payload_for_write_ack() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let header = MessageHeader::new(MessageType::WriteAck, 1, 2, 16);
+            stream.write_all(&header.to_bytes()).unwrap();
+            stream.write_all(&[0xEE; 16]).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let transport = TcpTransport::new_insecure(2);
+        let mut client_stream = SecureStream {
+            stream: TcpStream::connect(addr).unwrap(),
+            session: None,
+            peer_id: None,
+        };
+        let result = transport.recv_response(&mut client_stream, 1);
+
+        server.join().unwrap();
+        assert!(matches!(result, Err(IoError::Corrupted)));
+    }
+
+    #[test]
+    fn client_rejects_extreme_payload_len_before_allocation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let header = MessageHeader::new(MessageType::ReadReply, 1, 2, u32::MAX);
+            stream.write_all(&header.to_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let transport = TcpTransport::new_insecure(2);
+        let mut client_stream = SecureStream {
+            stream: TcpStream::connect(addr).unwrap(),
+            session: None,
+            peer_id: None,
+        };
+        let result = transport.recv_response(&mut client_stream, 1);
+
+        server.join().unwrap();
+        assert!(matches!(result, Err(IoError::Corrupted)));
     }
 
     #[test]
