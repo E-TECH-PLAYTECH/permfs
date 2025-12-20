@@ -142,16 +142,22 @@ dlm.release(&grant)?;
 ### Network Transport
 
 ```rust
-use permfs::transport::{TcpTransport, TcpServer};
+use permfs::transport::{NodeAuthConfig, SharedSecret, TcpTransport, TcpServer};
 
 // Client
 let transport = TcpTransport::new(local_node_id);
-transport.registry().register(remote_node_id, "192.168.1.10:7432".parse()?);
+transport.registry().register(
+    remote_node_id,
+    "192.168.1.10:7432".parse()?,
+    NodeAuthConfig::new(SharedSecret::new(1, b"shared-cluster-secret".to_vec())),
+);
 
 // Server
-let server = TcpServer::bind(local_node_id, "0.0.0.0:7432".parse()?)?;
+let registry = transport.registry().clone();
+let server = TcpServer::bind(local_node_id, "0.0.0.0:7432".parse()?, registry)?;
 server.run(handler);
 ```
+Use `NodeAuthConfig::with_rollover` to accept both the current and next shared secret during rotations.
 
 ## Testing
 

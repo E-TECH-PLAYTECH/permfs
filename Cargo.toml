@@ -26,6 +26,9 @@ block-discard = ["std"]
 [dependencies]
 bitflags = { version = "2.4", default-features = false }
 log = { version = "0.4", optional = true }
+hmac = "0.12"
+rand = "0.8"
+sha2 = "0.10"
 
 # Optional std dependencies
 fuser = { version = "0.14", optional = true }

@@ -4,7 +4,9 @@
 #[cfg(feature = "network")]
 fn main() {
     use permfs::mock::MemoryBlockDevice;
-    use permfs::transport::{RequestHandler, TcpServer, TcpTransport};
+    use permfs::transport::{
+        NodeAuthConfig, NodeRegistry, RequestHandler, SharedSecret, TcpServer,
+    };
     use permfs::{AllocError, BlockAddr, BlockDevice, IoError, BLOCK_SIZE};
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -45,11 +47,32 @@ fn main() {
     println!("Starting PermFS cluster node...");
     println!("Listening on {}", bind_addr);
 
+    let registry = Arc::new(NodeRegistry::new(1));
+    if let (Ok(peer_id_str), Ok(peer_addr), Ok(shared_secret)) = (
+        std::env::var("PERMFS_PEER_ID"),
+        std::env::var("PERMFS_PEER_ADDR"),
+        std::env::var("PERMFS_SHARED_SECRET"),
+    ) {
+        if let Ok(peer_id) = peer_id_str.parse::<u64>() {
+            if let Ok(socket_addr) = peer_addr.parse::<SocketAddr>() {
+                registry.register(
+                    peer_id,
+                    socket_addr,
+                    NodeAuthConfig::new(SharedSecret::new(1, shared_secret.into_bytes())),
+                );
+                println!(
+                    "Registered peer {} at {} with shared secret key id {}",
+                    peer_id, socket_addr, 1
+                );
+            }
+        }
+    }
+
     let handler = Arc::new(LocalHandler {
         device: MemoryBlockDevice::new(1, 0),
     });
 
-    let server = TcpServer::bind(1, bind_addr).expect("Failed to bind");
+    let server = TcpServer::bind(1, bind_addr, Arc::clone(&registry)).expect("Failed to bind");
 
     ctrlc::set_handler(move || {
         println!("\nShutting down...");
