@@ -174,7 +174,7 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         reply.entry(&TTL, &inode_to_attr(permfs_to_fuse_ino(ino), &inode), 0);
     }
 
-    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+    fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         let sb = self.sb();
         let permfs_ino = fuse_to_permfs_ino(ino);
         match self.fs.read_inode(permfs_ino, &sb) {
