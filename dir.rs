@@ -39,6 +39,75 @@ impl DirEntry {
     pub fn is_deleted(&self) -> bool {
         self.inode == 0
     }
+
+    /// Safely read a DirEntry from a byte slice at the given offset.
+    /// Returns None if there isn't enough data or rec_len is 0.
+    pub fn read_from_bytes(buf: &[u8], offset: usize) -> Option<Self> {
+        if offset + Self::HEADER_SIZE > buf.len() {
+            return None;
+        }
+
+        let inode = u64::from_le_bytes(buf[offset..offset + 8].try_into().ok()?);
+        let rec_len = u16::from_le_bytes(buf[offset + 8..offset + 10].try_into().ok()?);
+        let name_len = buf[offset + 10];
+        let file_type = buf[offset + 11];
+
+        if rec_len == 0 {
+            return None;
+        }
+
+        let name_start = offset + Self::HEADER_SIZE;
+        let name_end = name_start + (name_len as usize).min(MAX_FILENAME_LEN);
+        if name_end > buf.len() {
+            return None;
+        }
+
+        let mut name = [0u8; MAX_FILENAME_LEN];
+        let copy_len = (name_len as usize).min(MAX_FILENAME_LEN);
+        if name_start + copy_len <= buf.len() {
+            name[..copy_len].copy_from_slice(&buf[name_start..name_start + copy_len]);
+        }
+
+        Some(Self {
+            inode,
+            rec_len,
+            name_len,
+            file_type,
+            name,
+        })
+    }
+
+    /// Safely write a DirEntry to a byte slice at the given offset.
+    /// Returns false if there isn't enough space.
+    pub fn write_to_bytes(&self, buf: &mut [u8], offset: usize) -> bool {
+        let total_size = Self::HEADER_SIZE + self.name_len as usize;
+        if offset + total_size > buf.len() {
+            return false;
+        }
+
+        buf[offset..offset + 8].copy_from_slice(&self.inode.to_le_bytes());
+        buf[offset + 8..offset + 10].copy_from_slice(&self.rec_len.to_le_bytes());
+        buf[offset + 10] = self.name_len;
+        buf[offset + 11] = self.file_type;
+        buf[offset + Self::HEADER_SIZE..offset + Self::HEADER_SIZE + self.name_len as usize]
+            .copy_from_slice(&self.name[..self.name_len as usize]);
+
+        true
+    }
+
+    /// Update the rec_len field in a byte buffer at the given offset.
+    pub fn write_rec_len(buf: &mut [u8], offset: usize, rec_len: u16) {
+        if offset + 10 <= buf.len() {
+            buf[offset + 8..offset + 10].copy_from_slice(&rec_len.to_le_bytes());
+        }
+    }
+
+    /// Update the inode field in a byte buffer at the given offset (for deletion).
+    pub fn write_inode(buf: &mut [u8], offset: usize, inode: u64) {
+        if offset + 8 <= buf.len() {
+            buf[offset..offset + 8].copy_from_slice(&inode.to_le_bytes());
+        }
+    }
 }
 
 // File type constants (matching ext4)
@@ -73,11 +142,10 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
 
             let mut pos = 0usize;
             while pos + DirEntry::HEADER_SIZE <= BLOCK_SIZE {
-                let entry = unsafe { &*(buf.as_ptr().add(pos) as *const DirEntry) };
-
-                if entry.rec_len == 0 {
-                    break; // End of entries in this block
-                }
+                let entry = match DirEntry::read_from_bytes(&buf, pos) {
+                    Some(e) => e,
+                    None => break, // End of entries or invalid
+                };
 
                 if !entry.is_deleted() && entry.name_len as usize == name.len() {
                     if &entry.name[..name.len()] == name {
@@ -140,20 +208,10 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
 
         // Initialize new directory block
         buf.fill(0);
-        let entry = DirEntry::new(child_ino, name, file_type);
-        let entry_bytes = unsafe {
-            core::slice::from_raw_parts(
-                &entry as *const DirEntry as *const u8,
-                DirEntry::HEADER_SIZE + name.len(),
-            )
-        };
-        buf[..entry_bytes.len()].copy_from_slice(entry_bytes);
-
+        let mut entry = DirEntry::new(child_ino, name, file_type);
         // Set rec_len to fill rest of block (last entry convention)
-        let rec_len_offset = 8; // offset of rec_len in DirEntry
-        let fill_len = (BLOCK_SIZE - DirEntry::entry_size(name.len())) as u16
-            + DirEntry::entry_size(name.len()) as u16;
-        buf[rec_len_offset..rec_len_offset + 2].copy_from_slice(&fill_len.to_le_bytes());
+        entry.rec_len = BLOCK_SIZE as u16;
+        entry.write_to_bytes(&mut buf, 0);
 
         self.write_block(new_block, &buf)?;
 
@@ -181,13 +239,13 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
 
             let mut pos = 0usize;
             let mut prev_pos: Option<usize> = None;
+            let mut prev_rec_len: u16 = 0;
 
             while pos + DirEntry::HEADER_SIZE <= BLOCK_SIZE {
-                let entry = unsafe { &*(buf.as_ptr().add(pos) as *const DirEntry) };
-
-                if entry.rec_len == 0 {
-                    break;
-                }
+                let entry = match DirEntry::read_from_bytes(&buf, pos) {
+                    Some(e) => e,
+                    None => break,
+                };
 
                 if !entry.is_deleted()
                     && entry.name_len as usize == name.len()
@@ -195,15 +253,12 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
                 {
                     // Found it — mark as deleted
                     if let Some(prev) = prev_pos {
-                        // Merge with previous entry
-                        let prev_entry =
-                            unsafe { &mut *(buf.as_mut_ptr().add(prev) as *mut DirEntry) };
-                        prev_entry.rec_len += entry.rec_len;
+                        // Merge with previous entry by extending its rec_len
+                        let new_rec_len = prev_rec_len + entry.rec_len;
+                        DirEntry::write_rec_len(&mut buf, prev, new_rec_len);
                     } else {
                         // First entry — just zero the inode
-                        let entry_mut =
-                            unsafe { &mut *(buf.as_mut_ptr().add(pos) as *mut DirEntry) };
-                        entry_mut.inode = 0;
+                        DirEntry::write_inode(&mut buf, pos, 0);
                     }
 
                     self.write_block(block_addr, &buf)?;
@@ -215,6 +270,7 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
                 }
 
                 prev_pos = Some(pos);
+                prev_rec_len = entry.rec_len;
                 pos += entry.rec_len as usize;
             }
 
@@ -234,26 +290,16 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         let mut buf = [0u8; BLOCK_SIZE];
 
         // "." entry
-        let dot = DirEntry::new(self_ino, b".", file_type::DIRECTORY);
         let dot_size = DirEntry::entry_size(1);
+        let mut dot = DirEntry::new(self_ino, b".", file_type::DIRECTORY);
+        dot.rec_len = dot_size as u16;
+        dot.write_to_bytes(&mut buf, 0);
 
         // ".." entry — gets rest of block
-        let dotdot = DirEntry::new(parent_ino, b"..", file_type::DIRECTORY);
-
-        // Write "."
-        let dot_bytes =
-            unsafe { core::slice::from_raw_parts(&dot as *const _ as *const u8, dot_size) };
-        buf[..dot_size].copy_from_slice(dot_bytes);
-        // Patch rec_len for "."
-        buf[8..10].copy_from_slice(&(dot_size as u16).to_le_bytes());
-
-        // Write ".." at offset dot_size
         let dotdot_size = BLOCK_SIZE - dot_size;
-        buf[dot_size..dot_size + DirEntry::HEADER_SIZE + 2].copy_from_slice(unsafe {
-            core::slice::from_raw_parts(&dotdot as *const _ as *const u8, DirEntry::HEADER_SIZE + 2)
-        });
-        // Patch rec_len for ".." to fill rest of block
-        buf[dot_size + 8..dot_size + 10].copy_from_slice(&(dotdot_size as u16).to_le_bytes());
+        let mut dotdot = DirEntry::new(parent_ino, b"..", file_type::DIRECTORY);
+        dotdot.rec_len = dotdot_size as u16;
+        dotdot.write_to_bytes(&mut buf, dot_size);
 
         self.write_block(block, &buf)
     }
@@ -271,11 +317,10 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
 
             let mut pos = 0usize;
             while pos + DirEntry::HEADER_SIZE <= BLOCK_SIZE {
-                let entry = unsafe { &*(buf.as_ptr().add(pos) as *const DirEntry) };
-
-                if entry.rec_len == 0 {
-                    break;
-                }
+                let entry = match DirEntry::read_from_bytes(&buf, pos) {
+                    Some(e) => e,
+                    None => break,
+                };
 
                 if !entry.is_deleted() {
                     let name = entry.name_slice();
@@ -303,16 +348,17 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         let mut pos = 0usize;
 
         while pos + DirEntry::HEADER_SIZE <= BLOCK_SIZE {
-            let entry = unsafe { &*(buf.as_ptr().add(pos) as *const DirEntry) };
-
-            if entry.rec_len == 0 {
-                // End of entries — check remaining space
-                let remaining = BLOCK_SIZE - pos;
-                if remaining >= needed_size {
-                    return Some(pos);
+            let entry = match DirEntry::read_from_bytes(buf, pos) {
+                Some(e) => e,
+                None => {
+                    // End of entries — check remaining space
+                    let remaining = BLOCK_SIZE - pos;
+                    if remaining >= needed_size {
+                        return Some(pos);
+                    }
+                    return None;
                 }
-                return None;
-            }
+            };
 
             let actual_size = if entry.is_deleted() {
                 0
@@ -337,48 +383,38 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         buf: &mut [u8; BLOCK_SIZE],
         pos: usize,
         new_entry: &DirEntry,
-        needed_size: usize,
+        _needed_size: usize,
     ) {
-        let existing = unsafe { &mut *(buf.as_mut_ptr().add(pos) as *mut DirEntry) };
+        let existing = DirEntry::read_from_bytes(buf, pos);
 
-        if existing.rec_len == 0 || existing.is_deleted() {
-            // Empty slot — just write
-            let entry_bytes = unsafe {
-                core::slice::from_raw_parts(
-                    new_entry as *const _ as *const u8,
-                    DirEntry::HEADER_SIZE + new_entry.name_len as usize,
-                )
-            };
-            buf[pos..pos + entry_bytes.len()].copy_from_slice(entry_bytes);
+        match existing {
+            None => {
+                // Empty slot — just write with rec_len filling to end of block
+                let mut entry = new_entry.clone();
+                entry.rec_len = (BLOCK_SIZE - pos) as u16;
+                entry.write_to_bytes(buf, pos);
+            }
+            Some(ex) if ex.is_deleted() => {
+                // Deleted slot — reuse with same rec_len
+                let mut entry = new_entry.clone();
+                entry.rec_len = ex.rec_len;
+                entry.write_to_bytes(buf, pos);
+            }
+            Some(ex) => {
+                // Split existing entry
+                let existing_actual = DirEntry::entry_size(ex.name_len as usize);
+                let old_rec_len = ex.rec_len;
 
-            // Set rec_len to fill to end of block or existing rec_len
-            let rec_len = if existing.rec_len == 0 {
-                (BLOCK_SIZE - pos) as u16
-            } else {
-                existing.rec_len
-            };
-            buf[pos + 8..pos + 10].copy_from_slice(&rec_len.to_le_bytes());
-        } else {
-            // Split existing entry
-            let existing_actual = DirEntry::entry_size(existing.name_len as usize);
-            let old_rec_len = existing.rec_len;
+                // Shrink existing entry's rec_len
+                DirEntry::write_rec_len(buf, pos, existing_actual as u16);
 
-            // Shrink existing entry
-            existing.rec_len = existing_actual as u16;
-
-            // Write new entry after it
-            let new_pos = pos + existing_actual;
-            let entry_bytes = unsafe {
-                core::slice::from_raw_parts(
-                    new_entry as *const _ as *const u8,
-                    DirEntry::HEADER_SIZE + new_entry.name_len as usize,
-                )
-            };
-            buf[new_pos..new_pos + entry_bytes.len()].copy_from_slice(entry_bytes);
-
-            // New entry gets remaining space
-            let new_rec_len = old_rec_len - existing_actual as u16;
-            buf[new_pos + 8..new_pos + 10].copy_from_slice(&new_rec_len.to_le_bytes());
+                // Write new entry after it
+                let new_pos = pos + existing_actual;
+                let new_rec_len = old_rec_len - existing_actual as u16;
+                let mut entry = new_entry.clone();
+                entry.rec_len = new_rec_len;
+                entry.write_to_bytes(buf, new_pos);
+            }
         }
     }
 }

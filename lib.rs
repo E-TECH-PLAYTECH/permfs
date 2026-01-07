@@ -68,8 +68,12 @@ pub mod time;
 #[cfg(feature = "alloc")]
 pub mod write;
 
+#[cfg(feature = "std")]
+pub mod file_device;
 #[cfg(feature = "fuse")]
 pub mod fuse;
+#[cfg(feature = "std")]
+pub mod local;
 #[cfg(feature = "std")]
 pub mod mock;
 #[cfg(feature = "network")]
@@ -273,6 +277,7 @@ impl Inode {
 // DIRECTORY ENTRY
 // ============================================================================
 
+#[derive(Clone)]
 #[repr(C)]
 pub struct DirEntry {
     pub inode: u64,    // inode number
@@ -493,6 +498,27 @@ impl ShardAllocator {
 
     pub fn free_blocks(&self) -> u64 {
         self.free_count.load(Ordering::Relaxed)
+    }
+
+    /// Mark a range of blocks as used (for initializing after mkfs)
+    pub fn mark_used_range(&self, start: u64, count: u64) {
+        for i in 0..count {
+            let block = start + i;
+            if block >= self.capacity_blocks {
+                break;
+            }
+            let word_idx = (block / 64) as usize;
+            let bit = block % 64;
+            let mask = 1u64 << bit;
+            if word_idx < self.bitmap_words {
+                let word = unsafe { &*self.bitmap.as_ptr().add(word_idx) };
+                let prev = word.fetch_or(mask, Ordering::Relaxed);
+                // Only decrement free count if bit wasn't already set
+                if prev & mask == 0 {
+                    self.free_count.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+        }
     }
 }
 
@@ -783,10 +809,23 @@ mod allocator_tests {
     #[test]
     fn detects_wrong_volume_free() {
         let (mut fs, _, node_id, volume_id) = build_fs_with_volume();
+        // Test 1: Non-existent volume returns WrongVolume
         let wrong_addr = BlockAddr::new(node_id, volume_id + 1, 0, 0);
-
         let result = fs.free_block(wrong_addr);
         assert_eq!(result.unwrap_err(), AllocError::WrongVolume);
+
+        // Test 2: Address with wrong volume_id passed to existing allocator increments counter
+        // Create an address that will go to volume 0's allocator but claims wrong volume
+        let wrong_vol_addr = BlockAddr::new(node_id, volume_id, 0, 0);
+        // Allocate from the correct volume so we have a valid block
+        let valid_addr = fs.alloc_block(Some(volume_id)).expect("alloc");
+        // Create a fake address with wrong node_id - this will hit VolumeAllocator::resolve_shard_for_addr
+        let mismatched_addr = BlockAddr::new(node_id + 1, volume_id, 0, valid_addr.block_offset());
+        let result2 = fs.volumes[volume_id as usize]
+            .as_ref()
+            .unwrap()
+            .free_block(mismatched_addr);
+        assert_eq!(result2.unwrap_err(), AllocError::WrongVolume);
 
         let counters = fs.volumes[volume_id as usize]
             .as_ref()
@@ -902,6 +941,16 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
     pub fn set_verify_checksums(&mut self, enabled: bool) {
         self.verify_checksums = enabled;
     }
+
+    /// Register a volume allocator for a given volume ID
+    pub fn register_volume(&mut self, volume_id: u32, allocator: VolumeAllocator) -> Result<(), AllocError> {
+        let idx = volume_id as usize;
+        if idx >= MAX_VOLUMES_PER_NODE as usize {
+            return Err(AllocError::WrongVolume);
+        }
+        self.volumes[idx] = Some(Box::new(allocator));
+        Ok(())
+    }
 }
 
 impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
@@ -953,7 +1002,7 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
             let vol_id = addr.volume_id() as usize;
             match &self.volumes[vol_id] {
                 Some(vol) => vol.free_block(addr),
-                None => Err(AllocError::InvalidShard),
+                None => Err(AllocError::WrongVolume),
             }
         } else {
             self.cluster.free_remote(addr.node_id(), addr)
@@ -1067,14 +1116,22 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         let mut buf = [0u8; BLOCK_SIZE];
         self.read_block(block, &mut buf)?;
 
-        let ptrs = unsafe {
-            core::slice::from_raw_parts(
-                buf.as_ptr() as *const BlockAddr,
-                BLOCK_SIZE / core::mem::size_of::<BlockAddr>(),
-            )
-        };
+        // BlockAddr is 32 bytes (4 × u64)
+        const ADDR_SIZE: usize = core::mem::size_of::<BlockAddr>();
+        let offset = idx * ADDR_SIZE;
+        if offset + ADDR_SIZE > BLOCK_SIZE {
+            return Err(IoError::InvalidAddress);
+        }
 
-        let addr = ptrs[idx];
+        // Read limbs from bytes (little-endian)
+        let limbs = [
+            u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap()),
+            u64::from_le_bytes(buf[offset + 8..offset + 16].try_into().unwrap()),
+            u64::from_le_bytes(buf[offset + 16..offset + 24].try_into().unwrap()),
+            u64::from_le_bytes(buf[offset + 24..offset + 32].try_into().unwrap()),
+        ];
+        let addr = BlockAddr { limbs };
+
         if addr.is_null() {
             Err(IoError::NotFound)
         } else {

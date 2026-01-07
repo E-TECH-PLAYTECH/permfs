@@ -336,10 +336,14 @@ unsafe impl core::alloc::GlobalAlloc for GlobalAllocatorBridge {
 #[global_allocator]
 static GLOBAL_ALLOCATOR: GlobalAllocatorBridge = GlobalAllocatorBridge;
 
+/// Aligned buffer wrapper to ensure 16-byte alignment for allocations
+#[repr(C, align(16))]
+struct AlignedBuffer<const N: usize>([u8; N]);
+
 /// Fixed-size allocator that can be embedded by platform code.
 /// Useful when the host wants an owned allocator separate from the global one.
 pub struct FixedRegionAllocator<const N: usize> {
-    region: core::cell::UnsafeCell<[u8; N]>,
+    region: core::cell::UnsafeCell<AlignedBuffer<N>>,
     cursor: core::sync::atomic::AtomicUsize,
 }
 
@@ -348,7 +352,7 @@ unsafe impl<const N: usize> Sync for FixedRegionAllocator<N> {}
 impl<const N: usize> FixedRegionAllocator<N> {
     pub const fn new() -> Self {
         Self {
-            region: core::cell::UnsafeCell::new([0; N]),
+            region: core::cell::UnsafeCell::new(AlignedBuffer([0; N])),
             cursor: core::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -371,8 +375,8 @@ impl<const N: usize> FixedRegionAllocator<N> {
                 Err(_) => return core::ptr::null_mut(),
             };
 
-        // SAFETY: the region is private to this allocator
-        unsafe { (*self.region.get()).as_mut_ptr().add(allocation_start) }
+        // SAFETY: the region is private to this allocator and AlignedBuffer ensures 16-byte alignment
+        unsafe { (*self.region.get()).0.as_mut_ptr().add(allocation_start) }
     }
 }
 
@@ -427,6 +431,7 @@ impl crate::time::Clock for PlatformClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::alloc::GlobalAlloc;
 
     #[test]
     fn fixed_region_allocator_aligns() {
