@@ -4,21 +4,20 @@
 
 use crate::sync::{Arc, RwLock};
 use crate::*;
-use core::sync::atomic::{AtomicU32, Ordering};
 use std::collections::HashMap;
 
 pub struct MemoryBlockDevice {
     blocks: RwLock<HashMap<BlockAddr, [u8; BLOCK_SIZE]>>,
-    node_id: u64,
-    volume_id: u32,
+    _node_id: u64,
+    _volume_id: u32,
 }
 
 impl MemoryBlockDevice {
     pub fn new(node_id: u64, volume_id: u32) -> Self {
         Self {
             blocks: RwLock::new(HashMap::new()),
-            node_id,
-            volume_id,
+            _node_id: node_id,
+            _volume_id: volume_id,
         }
     }
 

@@ -87,7 +87,7 @@ impl BlockBackend for std::fs::File {
         self.sync_all()
     }
 
-    fn trim(&self, offset: u64, len: u64) -> IoResult<()> {
+    fn trim(&self, _offset: u64, _len: u64) -> IoResult<()> {
         #[cfg(all(unix, feature = "block-discard"))]
         unsafe {
             use std::os::unix::io::AsRawFd;

@@ -36,8 +36,7 @@ pub fn crc32c(data: &[u8]) -> u32 {
 
 /// Update running CRC32C with additional data
 #[inline]
-pub fn crc32c_update(mut crc: u32, data: &[u8]) -> u32 {
-    // Try hardware acceleration first
+pub fn crc32c_update(crc: u32, data: &[u8]) -> u32 {
     #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
     {
         return crc32c_hw(crc, data);
@@ -48,11 +47,17 @@ pub fn crc32c_update(mut crc: u32, data: &[u8]) -> u32 {
         return crc32c_arm(crc, data);
     }
 
-    // Software fallback
-    for &byte in data {
-        crc = CRC32C_TABLE[((crc ^ byte as u32) & 0xFF) as usize] ^ (crc >> 8);
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_feature = "sse4.2"),
+        all(target_arch = "aarch64", target_feature = "crc")
+    )))]
+    {
+        let mut crc = crc;
+        for &byte in data {
+            crc = CRC32C_TABLE[((crc ^ byte as u32) & 0xFF) as usize] ^ (crc >> 8);
+        }
+        crc
     }
-    crc
 }
 
 /// x86_64 hardware CRC32C using SSE4.2

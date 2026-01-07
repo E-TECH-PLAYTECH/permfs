@@ -3,7 +3,7 @@
 #![cfg(feature = "fuse")]
 
 use crate::sync::{Arc, Mutex, RwLock};
-use crate::vfs::{OpenFlags, StatFs, VfsOperations};
+use crate::vfs::OpenFlags;
 use crate::*;
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
@@ -74,7 +74,7 @@ fn mode_to_kind(mode: u32) -> FileType {
 
 struct OpenFile {
     ino: u64,
-    flags: OpenFlags,
+    _flags: OpenFlags,
 }
 
 pub struct FuseFs<B: BlockDevice, T: ClusterTransport> {
@@ -446,7 +446,7 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
             fh,
             OpenFile {
                 ino,
-                flags: OpenFlags::READ | OpenFlags::WRITE,
+                _flags: OpenFlags::READ | OpenFlags::WRITE,
             },
         );
 
@@ -583,7 +583,7 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
             fh,
             OpenFile {
                 ino: permfs_ino,
-                flags: open_flags,
+                _flags: open_flags,
             },
         );
 

@@ -410,7 +410,7 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         let sb_addr = BlockAddr::new(self.node_id, 0, 0, 0);
         self.read_block(sb_addr, &mut buf)?;
 
-        use crate::mkfs::*;
+        
         self.mount(self.node_id, 0)
     }
 }

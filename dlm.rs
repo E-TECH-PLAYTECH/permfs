@@ -2,11 +2,11 @@
 #![cfg(feature = "std")]
 
 use crate::{
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, RwLock},
     time::Clock,
-    BlockAddr, FsResult, IoError,
+    BlockAddr, IoError,
 };
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "std")]
 use std::collections::HashMap;
@@ -196,7 +196,7 @@ struct LockEntry {
 pub struct LocalLockTable {
     locks: RwLock<HashMap<LockId, LockEntry>>,
     sequence: AtomicU64,
-    local_node: u64,
+    _local_node: u64,
 }
 
 #[cfg(feature = "std")]
@@ -205,7 +205,7 @@ impl LocalLockTable {
         Self {
             locks: RwLock::new(HashMap::new()),
             sequence: AtomicU64::new(1),
-            local_node,
+            _local_node: local_node,
         }
     }
 

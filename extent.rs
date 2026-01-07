@@ -200,8 +200,8 @@ const fn max_index_entries() -> u16 {
 /// In-memory extent tree for a file
 pub struct ExtentTree {
     root: BlockAddr,
-    depth: u16,
-    entries: u16,
+    _depth: u16,
+    _entries: u16,
 }
 
 impl ExtentTree {
@@ -209,8 +209,8 @@ impl ExtentTree {
     pub fn new() -> Self {
         Self {
             root: BlockAddr::NULL,
-            depth: 0,
-            entries: 0,
+            _depth: 0,
+            _entries: 0,
         }
     }
 
@@ -218,8 +218,8 @@ impl ExtentTree {
     pub fn from_root(root: BlockAddr) -> Self {
         Self {
             root,
-            depth: 0, // Will be read from block
-            entries: 0,
+            _depth: 0, // Will be read from block
+            _entries: 0,
         }
     }
 

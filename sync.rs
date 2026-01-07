@@ -3,9 +3,6 @@
 //! `parking_lot` when the `network` feature is enabled). In `no_std` builds we
 //! provide lightweight spin-based locks backed by atomics.
 
-use core::cell::UnsafeCell;
-use core::hint::spin_loop;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(feature = "alloc")]
 pub use alloc::sync::Arc;

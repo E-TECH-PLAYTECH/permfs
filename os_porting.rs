@@ -7,7 +7,7 @@
 use core::fmt::{self, Write};
 #[cfg(not(feature = "std"))]
 use core::sync::atomic::{AtomicPtr, AtomicU8};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::Ordering;
 
 #[cfg(not(feature = "std"))]
 use crate::panic_support::{allocator_panic_report, try_panic_quiesce, AllocatorPanicReport};

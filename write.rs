@@ -266,7 +266,7 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         &self,
         inode: &mut Inode,
         new_size: u64,
-        sb: &Superblock,
+        _sb: &Superblock,
     ) -> FsResult<()> {
         if new_size >= inode.size {
             inode.size = new_size;

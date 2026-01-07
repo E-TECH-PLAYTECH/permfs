@@ -12,7 +12,7 @@ compile_error!("permfs requires the `alloc` feature when `std` is disabled");
 extern crate alloc;
 
 #[cfg(feature = "alloc")]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{boxed::Box, vec::Vec};
 
 #[cfg(feature = "alloc")]
 use crate::panic_support::{record_allocator_event, AllocatorEvent, AllocatorEventKind};
@@ -367,7 +367,7 @@ pub type FsResult<T> = Result<T, IoError>;
 pub struct ShardAllocator {
     shard_id: u16,
     capacity_blocks: u64,
-    bitmap_owner: Box<[AtomicU64]>,
+    _bitmap_owner: Box<[AtomicU64]>,
     /// Bitmap: 1 bit per block, 1M blocks = 128 KiB bitmap
     bitmap: NonNull<AtomicU64>,
     bitmap_words: usize,
@@ -376,7 +376,7 @@ pub struct ShardAllocator {
     /// Free block count for this shard
     free_count: AtomicU64,
     /// Generation counter for ABA prevention
-    generation: AtomicU32,
+    _generation: AtomicU32,
 }
 
 // Safety: bitmap is internally synchronized with atomics
@@ -406,13 +406,13 @@ impl ShardAllocator {
         Self {
             shard_id,
             capacity_blocks: capacity,
-            bitmap_owner,
+            _bitmap_owner: bitmap_owner,
             // Bitmap pointer is kept for fast indexing
             bitmap: bitmap_ptr,
             bitmap_words,
             next_hint: AtomicU64::new(0),
             free_count: AtomicU64::new(capacity),
-            generation: AtomicU32::new(0),
+            _generation: AtomicU32::new(0),
         }
     }
 
