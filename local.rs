@@ -115,10 +115,8 @@ impl InProcessTransport {
             Arc::new(move |volume: u32| {
                 let idx = volume as usize;
                 fs.volumes
-                    .read()
-                    .unwrap()
                     .get(idx)
-                    .and_then(|v: &Option<Box<VolumeAllocator>>| v.as_ref())
+                    .and_then(|v| v.as_ref())
                     .ok_or(AllocError::WrongVolume)?
                     .alloc_block()
             })
@@ -128,10 +126,8 @@ impl InProcessTransport {
             Arc::new(move |addr: BlockAddr| {
                 let idx = addr.volume_id() as usize;
                 fs.volumes
-                    .read()
-                    .unwrap()
                     .get(idx)
-                    .and_then(|v: &Option<Box<VolumeAllocator>>| v.as_ref())
+                    .and_then(|v| v.as_ref())
                     .ok_or(AllocError::WrongVolume)?
                     .free_block(addr)
             })
@@ -232,10 +228,12 @@ impl MemoryFsBuilder {
     }
 
     pub fn build(self) -> Result<(Arc<MemoryFs>, Superblock), IoError> {
+        use crate::{ShardAllocator, VolumeAllocator};
+
         let transport = InProcessTransport::new();
         let device = MemoryBlockDevice::new(self.node_id, self.volume_id);
 
-        let fs = PermFs::new(self.node_id, device, transport.clone());
+        let mut fs = PermFs::new(self.node_id, device, transport.clone());
 
         let params = crate::mkfs::MkfsParams {
             node_id: self.node_id,
@@ -248,6 +246,16 @@ impl MemoryFsBuilder {
         };
 
         let result = fs.mkfs(&params)?;
+
+        // Set up the block allocator
+        let mut volume = VolumeAllocator::new(self.node_id, self.volume_id);
+        let shard = ShardAllocator::new(0, self.total_blocks);
+        // Mark metadata blocks + root directory block as used
+        // data_start is where the root directory block is allocated
+        shard.mark_used_range(0, result.data_start + 1);
+        volume.add_shard(shard).map_err(|_| IoError::IoFailed)?;
+        fs.register_volume(self.volume_id, volume).map_err(|_| IoError::IoFailed)?;
+
         let fs = Arc::new(fs);
         transport.register(self.node_id, fs.clone());
 
@@ -292,8 +300,10 @@ impl DiskFsBuilder {
 
     pub fn build(self) -> Result<(Arc<DiskFs>, Superblock), IoError> {
         use crate::file_device::FileBlockDevice;
+        use crate::{ShardAllocator, VolumeAllocator};
 
-        let device = FileBlockDevice::open_or_create(
+        // Create fresh image file (truncates if exists)
+        let device = FileBlockDevice::create(
             &self.image_path,
             self.node_id,
             self.volume_id,
@@ -302,7 +312,7 @@ impl DiskFsBuilder {
         .map_err(|_| IoError::IoFailed)?;
 
         let transport = InProcessTransport::new();
-        let fs = PermFs::new(self.node_id, device, transport.clone());
+        let mut fs = PermFs::new(self.node_id, device, transport.clone());
 
         let params = crate::mkfs::MkfsParams {
             node_id: self.node_id,
@@ -315,6 +325,16 @@ impl DiskFsBuilder {
         };
 
         let result = fs.mkfs(&params)?;
+
+        // Set up the block allocator
+        let mut volume = VolumeAllocator::new(self.node_id, self.volume_id);
+        let shard = ShardAllocator::new(0, self.total_blocks);
+        // Mark metadata blocks + root directory block as used
+        // data_start is where the root directory block is allocated
+        shard.mark_used_range(0, result.data_start + 1);
+        volume.add_shard(shard).map_err(|_| IoError::IoFailed)?;
+        fs.register_volume(self.volume_id, volume).map_err(|_| IoError::IoFailed)?;
+
         let fs = Arc::new(fs);
         transport.register(self.node_id, fs.clone());
 
@@ -323,18 +343,35 @@ impl DiskFsBuilder {
 
     pub fn open_existing(self) -> Result<(Arc<DiskFs>, Superblock), IoError> {
         use crate::file_device::FileBlockDevice;
+        use crate::{ShardAllocator, VolumeAllocator};
 
-        let device = FileBlockDevice::open_or_create(
+        // Open existing image without truncating
+        let device = FileBlockDevice::open_existing(
             &self.image_path,
             self.node_id,
             self.volume_id,
-            self.total_blocks,
         )
         .map_err(|_| IoError::IoFailed)?;
 
+        let total_blocks = device.total_blocks();
+
         let transport = InProcessTransport::new();
-        let fs = PermFs::new(self.node_id, device, transport.clone());
+        let mut fs = PermFs::new(self.node_id, device, transport.clone());
         let sb = fs.mount(self.node_id, self.volume_id)?;
+
+        // Set up the block allocator
+        // Calculate data_start: journal_start + journal_blocks
+        // We hardcode journal_blocks = 128 to match the build() method
+        // TODO: In a full implementation, read the block bitmap from disk
+        let journal_blocks = 128u64;
+        let data_start = sb.journal_start.block_offset() + journal_blocks;
+        let mut volume = VolumeAllocator::new(self.node_id, self.volume_id);
+        let shard = ShardAllocator::new(0, total_blocks);
+        // Mark metadata + root directory block as used
+        shard.mark_used_range(0, data_start + 1);
+        volume.add_shard(shard).map_err(|_| IoError::IoFailed)?;
+        fs.register_volume(self.volume_id, volume).map_err(|_| IoError::IoFailed)?;
+
         let fs = Arc::new(fs);
         transport.register(self.node_id, fs.clone());
 

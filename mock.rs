@@ -117,10 +117,12 @@ impl TestFsBuilder {
     }
 
     pub fn build(self) -> Result<(Arc<TestFs>, Superblock), IoError> {
+        use crate::{ShardAllocator, VolumeAllocator};
+
         let device = MemoryBlockDevice::new(self.node_id, self.volume_id);
         let transport = NullTransport;
 
-        let fs = PermFs::new(self.node_id, device, transport);
+        let mut fs = PermFs::new(self.node_id, device, transport);
 
         let params = crate::mkfs::MkfsParams {
             node_id: self.node_id,
@@ -133,6 +135,15 @@ impl TestFsBuilder {
         };
 
         let result = fs.mkfs(&params)?;
+
+        // Set up the block allocator (same as local.rs)
+        let mut volume = VolumeAllocator::new(self.node_id, self.volume_id);
+        let shard = ShardAllocator::new(0, self.total_blocks);
+        // Mark metadata blocks + root directory block as used
+        shard.mark_used_range(0, result.data_start + 1);
+        volume.add_shard(shard).map_err(|_| IoError::IoFailed)?;
+        fs.register_volume(self.volume_id, volume).map_err(|_| IoError::IoFailed)?;
+
         Ok((Arc::new(fs), result.superblock))
     }
 }

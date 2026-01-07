@@ -250,7 +250,7 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
 
         let now = self.current_time();
         let mut root = Inode {
-            mode: 0o040755, // directory + rwxr-xr-x
+            mode: 0o040777, // directory + rwxrwxrwx (world-writable root)
             uid: 0,
             gid: 0,
             flags: 0,

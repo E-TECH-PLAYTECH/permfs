@@ -194,6 +194,7 @@ impl JournalHeader {
 
 /// Transaction descriptor
 #[repr(C)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct TxDescriptor {
     pub magic: u64,
     pub seq: u64,

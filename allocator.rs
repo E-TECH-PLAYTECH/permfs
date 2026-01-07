@@ -419,34 +419,15 @@ impl<B: BlockDevice> AllocatorPanicReporter for CachedVolumeAllocator<B> {
 mod tests {
     use super::*;
     use crate::mock::MemoryBlockDevice;
-    use core::ptr::NonNull;
-    use core::sync::atomic::{AtomicU32, AtomicU64};
+    use crate::{AllocatorErrorCounters, ShardAllocator, VolumeAllocator, BLOCKS_PER_SHARD};
+    use core::sync::atomic::AtomicU32;
 
     fn dummy_volume(node: u64, volume: u32) -> VolumeAllocator {
-        let mut shards: [Option<Box<crate::ShardAllocator>>; crate::SHARDS_PER_VOLUME as usize] =
-            core::array::from_fn(|idx| {
-                let bitmap_words = (crate::BLOCKS_PER_SHARD / 64) as usize;
-                let mut backing = vec![0u64; bitmap_words].into_boxed_slice();
-                let ptr = NonNull::new(backing.as_mut_ptr()).unwrap();
-                core::mem::forget(backing);
-                Some(Box::new(crate::ShardAllocator {
-                    shard_id: idx as u16,
-                    bitmap: ptr,
-                    bitmap_words,
-                    next_hint: AtomicU64::new(0),
-                    free_count: AtomicU64::new(crate::BLOCKS_PER_SHARD),
-                    generation: AtomicU32::new(0),
-                }))
-            });
-
-        VolumeAllocator {
-            node_id: node,
-            volume_id: volume,
-            shards,
-            current_shard: AtomicU32::new(0),
-            counters: AllocatorErrorCounters::default(),
-            epoch: AtomicU64::new(0),
-        }
+        let mut vol = VolumeAllocator::new(node, volume);
+        // Add a shard with full capacity
+        let shard = ShardAllocator::new(0, BLOCKS_PER_SHARD);
+        vol.add_shard(shard).expect("add shard");
+        vol
     }
 
     #[test]

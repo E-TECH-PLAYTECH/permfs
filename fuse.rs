@@ -15,6 +15,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const TTL: Duration = Duration::from_secs(1);
 
+// FUSE uses inode 1 for root (FUSE_ROOT_ID), PermFS uses inode 0
+// FUSE inode 0 is invalid/unused, so we offset by 1:
+//   FUSE 1 <-> PermFS 0 (root)
+//   FUSE 2 <-> PermFS 1
+//   FUSE 3 <-> PermFS 2
+//   etc.
+#[inline]
+fn fuse_to_permfs_ino(ino: u64) -> u64 {
+    ino.saturating_sub(1)
+}
+
+#[inline]
+fn permfs_to_fuse_ino(ino: u64) -> u64 {
+    ino + 1
+}
+
 fn inode_to_attr(ino: u64, inode: &Inode) -> FileAttr {
     FileAttr {
         ino,
@@ -119,7 +135,7 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> FuseFs<B, T> {
         let options = vec![
             MountOption::FSName("permfs".to_string()),
             MountOption::AutoUnmount,
-            MountOption::AllowOther,
+            MountOption::DefaultPermissions,
         ];
         fuser::mount2(self, mountpoint, &options)
     }
@@ -129,6 +145,7 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name = name.to_string_lossy();
         let sb = self.sb();
+        let parent = fuse_to_permfs_ino(parent);
 
         let parent_inode = match self.fs.read_inode(parent, &sb) {
             Ok(i) => i,
@@ -154,12 +171,13 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
             }
         };
 
-        reply.entry(&TTL, &inode_to_attr(ino, &inode), 0);
+        reply.entry(&TTL, &inode_to_attr(permfs_to_fuse_ino(ino), &inode), 0);
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
         let sb = self.sb();
-        match self.fs.read_inode(ino, &sb) {
+        let permfs_ino = fuse_to_permfs_ino(ino);
+        match self.fs.read_inode(permfs_ino, &sb) {
             Ok(inode) => reply.attr(&TTL, &inode_to_attr(ino, &inode)),
             Err(_) => reply.error(libc::ENOENT),
         }
@@ -184,7 +202,8 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         reply: ReplyAttr,
     ) {
         let sb = self.sb();
-        let mut inode = match self.fs.read_inode(ino, &sb) {
+        let permfs_ino = fuse_to_permfs_ino(ino);
+        let mut inode = match self.fs.read_inode(permfs_ino, &sb) {
             Ok(i) => i,
             Err(_) => {
                 reply.error(libc::ENOENT);
@@ -221,7 +240,7 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         }
 
         inode.ctime = self.fs.current_time();
-        if let Err(_) = self.fs.write_inode(ino, &inode, &sb) {
+        if let Err(_) = self.fs.write_inode(permfs_ino, &inode, &sb) {
             reply.error(libc::EIO);
             return;
         }
@@ -231,7 +250,7 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
 
     fn mkdir(
         &mut self,
-        _req: &Request,
+        req: &Request,
         parent: u64,
         name: &OsStr,
         mode: u32,
@@ -240,6 +259,9 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
     ) {
         let sb = self.sb();
         let name = name.to_string_lossy();
+        let parent = fuse_to_permfs_ino(parent);
+        let uid = req.uid();
+        let gid = req.gid();
 
         let ino = match self.fs.alloc_inode(&sb) {
             Ok(i) => i,
@@ -260,8 +282,8 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         let now = self.fs.current_time();
         let mut inode = Inode {
             mode: 0o040000 | (mode & 0o7777),
-            uid: 0,
-            gid: 0,
+            uid,
+            gid,
             flags: 0,
             size: BLOCK_SIZE as u64,
             blocks: 1,
@@ -303,12 +325,70 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         parent_inode.nlink += 1;
         let _ = self.fs.write_inode(parent, &parent_inode, &sb);
 
-        reply.entry(&TTL, &inode_to_attr(ino, &inode), 0);
+        reply.entry(&TTL, &inode_to_attr(permfs_to_fuse_ino(ino), &inode), 0);
+    }
+
+    fn mknod(
+        &mut self,
+        req: &Request,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        _rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        let sb = self.sb();
+        let name = name.to_string_lossy();
+        let parent = fuse_to_permfs_ino(parent);
+        let uid = req.uid();
+        let gid = req.gid();
+
+        let ino = match self.fs.alloc_inode(&sb) {
+            Ok(i) => i,
+            Err(_) => {
+                reply.error(libc::ENOSPC);
+                return;
+            }
+        };
+
+        let now = self.fs.current_time();
+        let inode = Inode {
+            mode,
+            uid,
+            gid,
+            flags: 0,
+            size: 0,
+            blocks: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            crtime: now,
+            nlink: 1,
+            generation: 0,
+            direct: [BlockAddr::NULL; INODE_DIRECT_BLOCKS],
+            indirect: [BlockAddr::NULL; INODE_INDIRECT_LEVELS],
+            extent_root: BlockAddr::NULL,
+            xattr_block: BlockAddr::NULL,
+            checksum: 0,
+        };
+
+        if self.fs.write_inode(ino, &inode, &sb).is_err()
+            || self
+                .fs
+                .add_dirent(parent, name.as_bytes(), ino, 1, &sb)
+                .is_err()
+        {
+            reply.error(libc::EIO);
+            return;
+        }
+
+        reply.entry(&TTL, &inode_to_attr(permfs_to_fuse_ino(ino), &inode), 0);
     }
 
     fn create(
         &mut self,
-        _req: &Request,
+        req: &Request,
         parent: u64,
         name: &OsStr,
         mode: u32,
@@ -318,6 +398,9 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
     ) {
         let sb = self.sb();
         let name = name.to_string_lossy();
+        let parent = fuse_to_permfs_ino(parent);
+        let uid = req.uid();
+        let gid = req.gid();
 
         let ino = match self.fs.alloc_inode(&sb) {
             Ok(i) => i,
@@ -330,8 +413,8 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         let now = self.fs.current_time();
         let inode = Inode {
             mode: 0o100000 | (mode & 0o7777),
-            uid: 0,
-            gid: 0,
+            uid,
+            gid,
             flags: 0,
             size: 0,
             blocks: 0,
@@ -367,12 +450,13 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
             },
         );
 
-        reply.created(&TTL, &inode_to_attr(ino, &inode), 0, fh, 0);
+        reply.created(&TTL, &inode_to_attr(permfs_to_fuse_ino(ino), &inode), 0, fh, 0);
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let sb = self.sb();
         let name = name.to_string_lossy();
+        let parent = fuse_to_permfs_ino(parent);
 
         let parent_inode = match self.fs.read_inode(parent, &sb) {
             Ok(i) => i,
@@ -424,6 +508,7 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let sb = self.sb();
         let name = name.to_string_lossy();
+        let parent = fuse_to_permfs_ino(parent);
 
         let parent_inode = match self.fs.read_inode(parent, &sb) {
             Ok(i) => i,
@@ -485,7 +570,8 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
 
     fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
         let sb = self.sb();
-        if self.fs.read_inode(ino, &sb).is_err() {
+        let permfs_ino = fuse_to_permfs_ino(ino);
+        if self.fs.read_inode(permfs_ino, &sb).is_err() {
             reply.error(libc::ENOENT);
             return;
         }
@@ -496,7 +582,7 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         self.open_files.lock().unwrap().insert(
             fh,
             OpenFile {
-                ino,
+                ino: permfs_ino,
                 flags: open_flags,
             },
         );
@@ -591,6 +677,21 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         }
     }
 
+    fn flush(&mut self, _req: &Request, _ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+        // Sync the device on flush
+        match self.fs.local_device.sync() {
+            Ok(_) => reply.ok(),
+            Err(_) => reply.error(libc::EIO),
+        }
+    }
+
+    fn fsync(&mut self, _req: &Request, _ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty) {
+        match self.fs.local_device.sync() {
+            Ok(_) => reply.ok(),
+            Err(_) => reply.error(libc::EIO),
+        }
+    }
+
     fn release(
         &mut self,
         _req: &Request,
@@ -614,8 +715,9 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         mut reply: ReplyDirectory,
     ) {
         let sb = self.sb();
+        let permfs_ino = fuse_to_permfs_ino(ino);
 
-        let inode = match self.fs.read_inode(ino, &sb) {
+        let inode = match self.fs.read_inode(permfs_ino, &sb) {
             Ok(i) => i,
             Err(_) => {
                 reply.error(libc::ENOENT);
@@ -672,7 +774,7 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         }
 
         for (i, (entry_ino, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
-            if reply.add(*entry_ino, (i + 1) as i64, *kind, name) {
+            if reply.add(permfs_to_fuse_ino(*entry_ino), (i + 1) as i64, *kind, name) {
                 break;
             }
         }
