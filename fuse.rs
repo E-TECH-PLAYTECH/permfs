@@ -8,8 +8,8 @@ use crate::vfs::OpenFlags;
 use crate::*;
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request,
-    TimeOrNow,
+    ReplyEmpty, ReplyEntry, ReplyLock, ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
+    Request, TimeOrNow,
 };
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -1139,6 +1139,91 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         match self.fs.removexattr(ino, name.as_bytes(), &sb) {
             Ok(()) => reply.ok(),
             Err(IoError::NotFound) => reply.error(libc::ENODATA),
+            Err(_) => reply.error(libc::EIO),
+        }
+    }
+
+    fn lseek(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        whence: i32,
+        reply: ReplyLseek,
+    ) {
+        let sb = self.sb();
+        let ino = fuse_to_permfs_ino(ino);
+
+        let inode = match self.fs.read_inode(ino, &sb) {
+            Ok(i) => i,
+            Err(_) => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        // SEEK_HOLE = 3, SEEK_DATA = 4 on Linux/macOS
+        const SEEK_HOLE: i32 = 3;
+        const SEEK_DATA: i32 = 4;
+
+        let offset = if offset < 0 { 0u64 } else { offset as u64 };
+
+        match whence {
+            SEEK_HOLE => {
+                let result = self.fs.seek_hole(&inode, offset);
+                reply.offset(result as i64);
+            }
+            SEEK_DATA => {
+                match self.fs.seek_data(&inode, offset) {
+                    Ok(pos) => reply.offset(pos as i64),
+                    Err(IoError::NotFound) => reply.error(libc::ENXIO),
+                    Err(_) => reply.error(libc::EIO),
+                }
+            }
+            _ => {
+                // Unknown whence value
+                reply.error(libc::EINVAL);
+            }
+        }
+    }
+
+    fn fallocate(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        length: i64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        let sb = self.sb();
+        let ino = fuse_to_permfs_ino(ino);
+
+        if offset < 0 || length < 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
+
+        let mut inode = match self.fs.read_inode(ino, &sb) {
+            Ok(i) => i,
+            Err(_) => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        match self.fs.fallocate(&mut inode, mode as u32, offset as u64, length as u64, &sb) {
+            Ok(()) => {
+                if let Err(_) = self.fs.write_inode(ino, &inode, &sb) {
+                    reply.error(libc::EIO);
+                    return;
+                }
+                reply.ok();
+            }
+            Err(IoError::NoSpace) => reply.error(libc::ENOSPC),
+            Err(IoError::InvalidAddress) => reply.error(libc::EINVAL),
             Err(_) => reply.error(libc::EIO),
         }
     }

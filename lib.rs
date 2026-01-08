@@ -1152,7 +1152,7 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
 // ============================================================================
 
 impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
-    /// Read file data
+    /// Read file data (sparse-aware: holes return zeros)
     pub fn read_file(&self, inode: &Inode, offset: u64, buf: &mut [u8]) -> FsResult<usize> {
         if offset >= inode.size {
             return Ok(0);
@@ -1163,22 +1163,74 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         let end = core::cmp::min(offset + buf.len() as u64, inode.size);
 
         while file_offset < end {
-            let block_addr = self.get_block_for_offset(inode, file_offset)?;
             let offset_in_block = (file_offset % BLOCK_SIZE as u64) as usize;
             let bytes_in_block =
                 core::cmp::min(BLOCK_SIZE - offset_in_block, (end - file_offset) as usize);
 
-            let mut block_buf = [0u8; BLOCK_SIZE];
-            self.read_block(block_addr, &mut block_buf)?;
-
-            buf[total_read..total_read + bytes_in_block]
-                .copy_from_slice(&block_buf[offset_in_block..offset_in_block + bytes_in_block]);
+            match self.get_block_for_offset(inode, file_offset) {
+                Ok(block_addr) => {
+                    // Normal block - read data
+                    let mut block_buf = [0u8; BLOCK_SIZE];
+                    self.read_block(block_addr, &mut block_buf)?;
+                    buf[total_read..total_read + bytes_in_block]
+                        .copy_from_slice(&block_buf[offset_in_block..offset_in_block + bytes_in_block]);
+                }
+                Err(IoError::NotFound) => {
+                    // Hole - return zeros
+                    buf[total_read..total_read + bytes_in_block].fill(0);
+                }
+                Err(e) => return Err(e),
+            }
 
             total_read += bytes_in_block;
             file_offset += bytes_in_block as u64;
         }
 
         Ok(total_read)
+    }
+
+    /// Check if a block at the given offset is a hole (unallocated)
+    pub fn is_hole(&self, inode: &Inode, offset: u64) -> bool {
+        if offset >= inode.size {
+            return true;
+        }
+        matches!(self.get_block_for_offset(inode, offset), Err(IoError::NotFound))
+    }
+
+    /// Find the next hole starting from offset (for SEEK_HOLE)
+    /// Returns the offset of the next hole, or file size if no hole found
+    pub fn seek_hole(&self, inode: &Inode, offset: u64) -> u64 {
+        if offset >= inode.size {
+            return inode.size;
+        }
+
+        let mut pos = offset;
+        while pos < inode.size {
+            if self.is_hole(inode, pos) {
+                return pos;
+            }
+            // Move to next block boundary
+            pos = ((pos / BLOCK_SIZE as u64) + 1) * BLOCK_SIZE as u64;
+        }
+        inode.size
+    }
+
+    /// Find the next data region starting from offset (for SEEK_DATA)
+    /// Returns the offset of the next data, or error if no data found
+    pub fn seek_data(&self, inode: &Inode, offset: u64) -> FsResult<u64> {
+        if offset >= inode.size {
+            return Err(IoError::NotFound); // ENXIO
+        }
+
+        let mut pos = offset;
+        while pos < inode.size {
+            if !self.is_hole(inode, pos) {
+                return Ok(pos);
+            }
+            // Move to next block boundary
+            pos = ((pos / BLOCK_SIZE as u64) + 1) * BLOCK_SIZE as u64;
+        }
+        Err(IoError::NotFound) // ENXIO - no more data
     }
 }
 

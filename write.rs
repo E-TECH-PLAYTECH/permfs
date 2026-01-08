@@ -360,3 +360,250 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         Ok(())
     }
 }
+
+// ============================================================================
+// FALLOCATE - Sparse file operations
+// ============================================================================
+
+/// Fallocate mode flags (matching Linux)
+pub mod fallocate_mode {
+    /// Default: allocate disk space
+    pub const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
+    /// Deallocate space (punch hole)
+    pub const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
+    /// Zero range (may deallocate)
+    pub const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
+}
+
+impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
+    /// Preallocate or deallocate file space
+    ///
+    /// Modes:
+    /// - 0: Preallocate space, extend size
+    /// - KEEP_SIZE: Preallocate space, don't extend size
+    /// - PUNCH_HOLE | KEEP_SIZE: Deallocate blocks in range (create hole)
+    /// - ZERO_RANGE: Zero the range (currently implemented as punch + extend)
+    pub fn fallocate(
+        &self,
+        inode: &mut Inode,
+        mode: u32,
+        offset: u64,
+        len: u64,
+        sb: &Superblock,
+    ) -> FsResult<()> {
+        use fallocate_mode::*;
+
+        if len == 0 {
+            return Ok(());
+        }
+
+        let _end = offset.checked_add(len).ok_or(IoError::InvalidAddress)?;
+
+        // PUNCH_HOLE requires KEEP_SIZE
+        if mode & FALLOC_FL_PUNCH_HOLE != 0 {
+            if mode & FALLOC_FL_KEEP_SIZE == 0 {
+                return Err(IoError::InvalidAddress);
+            }
+            return self.punch_hole(inode, offset, len, sb);
+        }
+
+        // ZERO_RANGE: zero the specified range
+        if mode & FALLOC_FL_ZERO_RANGE != 0 {
+            return self.zero_range(inode, offset, len, mode & FALLOC_FL_KEEP_SIZE != 0, sb);
+        }
+
+        // Default: preallocate blocks
+        self.preallocate(inode, offset, len, mode & FALLOC_FL_KEEP_SIZE == 0, sb)
+    }
+
+    /// Preallocate blocks for a file range
+    fn preallocate(
+        &self,
+        inode: &mut Inode,
+        offset: u64,
+        len: u64,
+        extend_size: bool,
+        sb: &Superblock,
+    ) -> FsResult<()> {
+        let end = offset + len;
+        let start_block = offset / BLOCK_SIZE as u64;
+        let end_block = (end + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
+
+        // Allocate blocks that don't exist
+        for block_num in start_block..end_block {
+            let block_offset = block_num * BLOCK_SIZE as u64;
+            if self.get_block_for_offset(inode, block_offset).is_err() {
+                let new_block = self
+                    .alloc_block(Some(sb.volume_id))
+                    .map_err(|_| IoError::NoSpace)?;
+
+                // Zero the new block
+                let zero_buf = [0u8; BLOCK_SIZE];
+                self.write_block(new_block, &zero_buf)?;
+
+                self.set_block_for_offset(inode, block_offset, new_block, sb)?;
+                inode.blocks += 1;
+            }
+        }
+
+        if extend_size && end > inode.size {
+            inode.size = end;
+        }
+
+        inode.ctime = self.current_time();
+        Ok(())
+    }
+
+    /// Punch a hole in a file (deallocate blocks)
+    fn punch_hole(
+        &self,
+        inode: &mut Inode,
+        offset: u64,
+        len: u64,
+        _sb: &Superblock,
+    ) -> FsResult<()> {
+        // Only punch complete blocks - partial blocks get zeroed
+        let block_size = BLOCK_SIZE as u64;
+
+        // Round up start to next block boundary
+        let first_full_block = (offset + block_size - 1) / block_size;
+        // Round down end to block boundary
+        let end = offset + len;
+        let last_full_block = end / block_size;
+
+        // Handle partial block at start (zero it)
+        if offset % block_size != 0 {
+            let block_offset = (offset / block_size) * block_size;
+            if let Ok(addr) = self.get_block_for_offset(inode, block_offset) {
+                let mut buf = [0u8; BLOCK_SIZE];
+                self.read_block(addr, &mut buf)?;
+                let start_in_block = (offset % block_size) as usize;
+                let end_in_block = core::cmp::min(
+                    BLOCK_SIZE,
+                    start_in_block + len as usize,
+                );
+                buf[start_in_block..end_in_block].fill(0);
+                self.write_block(addr, &buf)?;
+            }
+        }
+
+        // Free complete blocks in the middle
+        for block_num in first_full_block..last_full_block {
+            let block_offset = block_num * block_size;
+            if let Ok(addr) = self.get_block_for_offset(inode, block_offset) {
+                self.free_block(addr).map_err(|_| IoError::IoFailed)?;
+
+                // Clear the block pointer - handle direct blocks in inode
+                let direct_limit = INODE_DIRECT_BLOCKS as u64;
+                if block_num < direct_limit {
+                    inode.direct[block_num as usize] = BlockAddr::NULL;
+                } else {
+                    self.clear_block_for_offset(inode, block_offset)?;
+                }
+                inode.blocks = inode.blocks.saturating_sub(1);
+            }
+        }
+
+        // Handle partial block at end (zero it)
+        if end % block_size != 0 && last_full_block > first_full_block {
+            let block_offset = last_full_block * block_size;
+            if block_offset < inode.size {
+                if let Ok(addr) = self.get_block_for_offset(inode, block_offset) {
+                    let mut buf = [0u8; BLOCK_SIZE];
+                    self.read_block(addr, &mut buf)?;
+                    let end_in_block = (end % block_size) as usize;
+                    buf[..end_in_block].fill(0);
+                    self.write_block(addr, &buf)?;
+                }
+            }
+        }
+
+        inode.ctime = self.current_time();
+        Ok(())
+    }
+
+    /// Zero a range in the file
+    fn zero_range(
+        &self,
+        inode: &mut Inode,
+        offset: u64,
+        len: u64,
+        keep_size: bool,
+        sb: &Superblock,
+    ) -> FsResult<()> {
+        let end = offset + len;
+
+        // For ranges within file, punch hole is equivalent for aligned blocks
+        if offset < inode.size {
+            let punch_end = core::cmp::min(end, inode.size);
+            if punch_end > offset {
+                self.punch_hole(inode, offset, punch_end - offset, sb)?;
+            }
+        }
+
+        // Extend size if needed
+        if !keep_size && end > inode.size {
+            inode.size = end;
+        }
+
+        inode.ctime = self.current_time();
+        Ok(())
+    }
+
+    /// Clear a block address in the inode (set to NULL for hole)
+    fn clear_block_for_offset(&self, inode: &Inode, offset: u64) -> FsResult<()> {
+        let block_num = offset / BLOCK_SIZE as u64;
+        let direct_limit = INODE_DIRECT_BLOCKS as u64;
+
+        if block_num < direct_limit {
+            // For direct blocks, we'd need mutable access to inode
+            // This is a limitation - caller should update inode.direct directly
+            // For now, just return Ok since the block was freed
+            return Ok(());
+        }
+
+        // For indirect blocks, we need to update the indirect block
+        let ptrs_per_block = (BLOCK_SIZE / core::mem::size_of::<BlockAddr>()) as u64;
+        let mut remaining = block_num - direct_limit;
+
+        if remaining < ptrs_per_block {
+            // Single indirect - update the pointer
+            return self.clear_indirect_ptr(inode.indirect[0], remaining as usize);
+        }
+        remaining -= ptrs_per_block;
+
+        let double_limit = ptrs_per_block * ptrs_per_block;
+        if remaining < double_limit {
+            let l1_idx = remaining / ptrs_per_block;
+            let l2_idx = remaining % ptrs_per_block;
+            let l1_addr = self.read_indirect_ptr(inode.indirect[1], l1_idx as usize)?;
+            return self.clear_indirect_ptr(l1_addr, l2_idx as usize);
+        }
+        remaining -= double_limit;
+
+        // Triple indirect
+        let l1_idx = remaining / (ptrs_per_block * ptrs_per_block);
+        let l2_idx = (remaining / ptrs_per_block) % ptrs_per_block;
+        let l3_idx = remaining % ptrs_per_block;
+
+        let l1_addr = self.read_indirect_ptr(inode.indirect[2], l1_idx as usize)?;
+        let l2_addr = self.read_indirect_ptr(l1_addr, l2_idx as usize)?;
+        self.clear_indirect_ptr(l2_addr, l3_idx as usize)
+    }
+
+    /// Clear an indirect pointer (set to NULL)
+    fn clear_indirect_ptr(&self, block: BlockAddr, idx: usize) -> FsResult<()> {
+        if block.is_null() {
+            return Ok(());
+        }
+
+        let mut buf = [0u8; BLOCK_SIZE];
+        self.read_block(block, &mut buf)?;
+
+        const ADDR_SIZE: usize = core::mem::size_of::<BlockAddr>();
+        let offset = idx * ADDR_SIZE;
+        buf[offset..offset + ADDR_SIZE].fill(0); // NULL address
+
+        self.write_block(block, &buf)
+    }
+}

@@ -552,4 +552,148 @@ mod tests {
         let len = fs.readlink_impl(ino, &mut buf, &sb).expect("readlink");
         assert_eq!(&buf[..len], b"/hello.txt");
     }
+
+    #[test]
+    fn test_sparse_file_read() {
+        let (fs, sb) = MemoryFsBuilder::new()
+            .total_blocks(5000)
+            .build()
+            .expect("mkfs failed");
+
+        let ino = fs.alloc_inode(&sb).expect("alloc inode");
+        let mut inode = Inode {
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            flags: 0,
+            size: 0,
+            blocks: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            crtime: 0,
+            nlink: 1,
+            generation: 0,
+            direct: [BlockAddr::NULL; INODE_DIRECT_BLOCKS],
+            indirect: [BlockAddr::NULL; INODE_INDIRECT_LEVELS],
+            extent_root: BlockAddr::NULL,
+            xattr_block: BlockAddr::NULL,
+            checksum: 0,
+        };
+
+        // Write data at block 0
+        let data0 = [0xAAu8; BLOCK_SIZE];
+        fs.write_file(&mut inode, 0, &data0, &sb).expect("write block 0");
+
+        // Write data at block 5 (creating a hole at blocks 1-4)
+        let data5 = [0xBBu8; BLOCK_SIZE];
+        fs.write_file(&mut inode, 5 * BLOCK_SIZE as u64, &data5, &sb)
+            .expect("write block 5");
+
+        // File should have size = 6 blocks worth, but only 2 blocks allocated
+        assert_eq!(inode.size, 6 * BLOCK_SIZE as u64);
+        assert_eq!(inode.blocks, 2);
+
+        fs.write_inode(ino, &inode, &sb).expect("save inode");
+        let inode = fs.read_inode(ino, &sb).expect("read inode");
+
+        // Read from block 0 - should get our data
+        let mut buf = vec![0u8; BLOCK_SIZE];
+        let read = fs.read_file(&inode, 0, &mut buf).expect("read block 0");
+        assert_eq!(read, BLOCK_SIZE);
+        assert!(buf.iter().all(|&b| b == 0xAA));
+
+        // Read from block 2 (hole) - should get zeros
+        let read = fs.read_file(&inode, 2 * BLOCK_SIZE as u64, &mut buf).expect("read hole");
+        assert_eq!(read, BLOCK_SIZE);
+        assert!(buf.iter().all(|&b| b == 0), "Hole should return zeros");
+
+        // Read from block 5 - should get our data
+        let read = fs.read_file(&inode, 5 * BLOCK_SIZE as u64, &mut buf).expect("read block 5");
+        assert_eq!(read, BLOCK_SIZE);
+        assert!(buf.iter().all(|&b| b == 0xBB));
+
+        // Test seek_hole and seek_data
+        assert!(!fs.is_hole(&inode, 0)); // Block 0 has data
+        assert!(fs.is_hole(&inode, BLOCK_SIZE as u64)); // Block 1 is a hole
+        assert!(fs.is_hole(&inode, 2 * BLOCK_SIZE as u64)); // Block 2 is a hole
+        assert!(!fs.is_hole(&inode, 5 * BLOCK_SIZE as u64)); // Block 5 has data
+
+        // seek_data from 0 should return 0 (already on data)
+        assert_eq!(fs.seek_data(&inode, 0).unwrap(), 0);
+
+        // seek_data from block 1 should find block 5
+        assert_eq!(fs.seek_data(&inode, BLOCK_SIZE as u64).unwrap(), 5 * BLOCK_SIZE as u64);
+
+        // seek_hole from 0 should find block 1
+        assert_eq!(fs.seek_hole(&inode, 0), BLOCK_SIZE as u64);
+    }
+
+    #[test]
+    fn test_fallocate_punch_hole() {
+        use crate::write::fallocate_mode::*;
+
+        let (fs, sb) = MemoryFsBuilder::new()
+            .total_blocks(5000)
+            .build()
+            .expect("mkfs failed");
+
+        let ino = fs.alloc_inode(&sb).expect("alloc inode");
+        let mut inode = Inode {
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            flags: 0,
+            size: 0,
+            blocks: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            crtime: 0,
+            nlink: 1,
+            generation: 0,
+            direct: [BlockAddr::NULL; INODE_DIRECT_BLOCKS],
+            indirect: [BlockAddr::NULL; INODE_INDIRECT_LEVELS],
+            extent_root: BlockAddr::NULL,
+            xattr_block: BlockAddr::NULL,
+            checksum: 0,
+        };
+
+        // Write 3 blocks of data
+        let data = [0xCCu8; BLOCK_SIZE];
+        for i in 0..3 {
+            fs.write_file(&mut inode, i * BLOCK_SIZE as u64, &data, &sb)
+                .expect("write");
+        }
+        assert_eq!(inode.blocks, 3);
+
+        // Punch hole in the middle block
+        fs.fallocate(
+            &mut inode,
+            FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+            BLOCK_SIZE as u64,
+            BLOCK_SIZE as u64,
+            &sb,
+        )
+        .expect("punch hole");
+
+        // Should have freed one block
+        assert_eq!(inode.blocks, 2);
+
+        fs.write_inode(ino, &inode, &sb).expect("save");
+        let inode = fs.read_inode(ino, &sb).expect("read");
+
+        // Read the hole - should get zeros
+        let mut buf = vec![0u8; BLOCK_SIZE];
+        let read = fs.read_file(&inode, BLOCK_SIZE as u64, &mut buf).expect("read hole");
+        assert_eq!(read, BLOCK_SIZE);
+        assert!(buf.iter().all(|&b| b == 0), "Punched hole should return zeros");
+
+        // Blocks 0 and 2 should still have data
+        fs.read_file(&inode, 0, &mut buf).expect("read 0");
+        assert!(buf.iter().all(|&b| b == 0xCC));
+
+        fs.read_file(&inode, 2 * BLOCK_SIZE as u64, &mut buf).expect("read 2");
+        assert!(buf.iter().all(|&b| b == 0xCC));
+    }
 }
