@@ -78,6 +78,8 @@ pub mod locking;
 pub mod xattr;
 #[cfg(feature = "std")]
 pub mod quota;
+#[cfg(feature = "compression")]
+pub mod compress;
 #[cfg(feature = "std")]
 pub mod local;
 #[cfg(feature = "std")]
