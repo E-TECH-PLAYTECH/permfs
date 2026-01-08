@@ -187,7 +187,20 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         self.write_block(block_addr, &buf)
     }
 
-    /// Get extended attribute (stub)
+    /// Get extended attribute
+    #[cfg(feature = "std")]
+    pub fn getxattr(
+        &self,
+        ino: u64,
+        name: &[u8],
+        buf: &mut [u8],
+        sb: &Superblock,
+    ) -> FsResult<usize> {
+        self.getxattr_impl(ino, name, buf, sb)
+    }
+
+    /// Get extended attribute (no-std stub)
+    #[cfg(not(feature = "std"))]
     pub fn getxattr(
         &self,
         _ino: u64,
@@ -198,7 +211,21 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         Err(IoError::NotFound)
     }
 
-    /// Set extended attribute (stub)
+    /// Set extended attribute
+    #[cfg(feature = "std")]
+    pub fn setxattr(
+        &self,
+        ino: u64,
+        name: &[u8],
+        value: &[u8],
+        flags: u32,
+        sb: &Superblock,
+    ) -> FsResult<()> {
+        self.setxattr_impl(ino, name, value, flags, sb)
+    }
+
+    /// Set extended attribute (no-std stub)
+    #[cfg(not(feature = "std"))]
     pub fn setxattr(
         &self,
         _ino: u64,
@@ -210,12 +237,26 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         Err(IoError::IoFailed)
     }
 
-    /// List extended attributes (stub)
+    /// List extended attributes
+    #[cfg(feature = "std")]
+    pub fn listxattr(&self, ino: u64, buf: &mut [u8], sb: &Superblock) -> FsResult<usize> {
+        self.listxattr_impl(ino, buf, sb)
+    }
+
+    /// List extended attributes (no-std stub)
+    #[cfg(not(feature = "std"))]
     pub fn listxattr(&self, _ino: u64, _buf: &mut [u8], _sb: &Superblock) -> FsResult<usize> {
         Ok(0)
     }
 
-    /// Remove extended attribute (stub)
+    /// Remove extended attribute
+    #[cfg(feature = "std")]
+    pub fn removexattr(&self, ino: u64, name: &[u8], sb: &Superblock) -> FsResult<()> {
+        self.removexattr_impl(ino, name, sb)
+    }
+
+    /// Remove extended attribute (no-std stub)
+    #[cfg(not(feature = "std"))]
     pub fn removexattr(&self, _ino: u64, _name: &[u8], _sb: &Superblock) -> FsResult<()> {
         Err(IoError::NotFound)
     }

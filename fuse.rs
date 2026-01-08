@@ -8,7 +8,8 @@ use crate::vfs::OpenFlags;
 use crate::*;
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request,
+    TimeOrNow,
 };
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -1053,6 +1054,92 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
                     reply.error(libc::EAGAIN);
                 }
             }
+        }
+    }
+
+    fn getxattr(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        name: &OsStr,
+        size: u32,
+        reply: ReplyXattr,
+    ) {
+        let sb = self.sb();
+        let ino = fuse_to_permfs_ino(ino);
+        let name = name.to_string_lossy();
+
+        if size == 0 {
+            // Size query
+            match self.fs.getxattr(ino, name.as_bytes(), &mut [], &sb) {
+                Ok(len) => reply.size(len as u32),
+                Err(IoError::NotFound) => reply.error(libc::ENODATA),
+                Err(_) => reply.error(libc::EIO),
+            }
+        } else {
+            let mut buf = vec![0u8; size as usize];
+            match self.fs.getxattr(ino, name.as_bytes(), &mut buf, &sb) {
+                Ok(len) => reply.data(&buf[..len]),
+                Err(IoError::NotFound) => reply.error(libc::ENODATA),
+                Err(IoError::InvalidAddress) => reply.error(libc::ERANGE),
+                Err(_) => reply.error(libc::EIO),
+            }
+        }
+    }
+
+    fn setxattr(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        let sb = self.sb();
+        let ino = fuse_to_permfs_ino(ino);
+        let name = name.to_string_lossy();
+
+        match self.fs.setxattr(ino, name.as_bytes(), value, flags as u32, &sb) {
+            Ok(()) => reply.ok(),
+            Err(IoError::NotFound) => reply.error(libc::ENODATA),
+            Err(IoError::AlreadyExists) => reply.error(libc::EEXIST),
+            Err(IoError::NoSpace) => reply.error(libc::ENOSPC),
+            Err(IoError::InvalidAddress) => reply.error(libc::EINVAL),
+            Err(_) => reply.error(libc::EIO),
+        }
+    }
+
+    fn listxattr(&mut self, _req: &Request, ino: u64, size: u32, reply: ReplyXattr) {
+        let sb = self.sb();
+        let ino = fuse_to_permfs_ino(ino);
+
+        if size == 0 {
+            // Size query
+            match self.fs.listxattr(ino, &mut [], &sb) {
+                Ok(len) => reply.size(len as u32),
+                Err(_) => reply.error(libc::EIO),
+            }
+        } else {
+            let mut buf = vec![0u8; size as usize];
+            match self.fs.listxattr(ino, &mut buf, &sb) {
+                Ok(len) => reply.data(&buf[..len]),
+                Err(IoError::InvalidAddress) => reply.error(libc::ERANGE),
+                Err(_) => reply.error(libc::EIO),
+            }
+        }
+    }
+
+    fn removexattr(&mut self, _req: &Request, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        let sb = self.sb();
+        let ino = fuse_to_permfs_ino(ino);
+        let name = name.to_string_lossy();
+
+        match self.fs.removexattr(ino, name.as_bytes(), &sb) {
+            Ok(()) => reply.ok(),
+            Err(IoError::NotFound) => reply.error(libc::ENODATA),
+            Err(_) => reply.error(libc::EIO),
         }
     }
 }

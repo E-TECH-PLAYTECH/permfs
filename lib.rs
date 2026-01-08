@@ -75,6 +75,8 @@ pub mod fuse;
 #[cfg(feature = "std")]
 pub mod locking;
 #[cfg(feature = "std")]
+pub mod xattr;
+#[cfg(feature = "std")]
 pub mod local;
 #[cfg(feature = "std")]
 pub mod mock;
