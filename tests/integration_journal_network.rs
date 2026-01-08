@@ -107,6 +107,93 @@ fn journal_skips_missing_commit() {
     assert!(out.iter().all(|b| *b == 0));
 }
 
+/// Test that journal recovery works during mount
+#[test]
+fn recovery_on_mount() {
+    use std::path::PathBuf;
+
+    let img = PathBuf::from("/tmp/permfs_journal_recovery.img");
+    let _ = std::fs::remove_file(&img);
+
+    let node_id = 1u64;
+    let volume_id = 0u32;
+
+    // Create fresh filesystem
+    let device = FileBlockDevice::create(&img, node_id, volume_id, 10000).unwrap();
+
+    // Set up journal header pointing to journal area (after superblock + inode table)
+    // For simplicity, use fixed offsets matching DiskFsBuilder
+    let journal_start = BlockAddr::new(node_id, volume_id, 0, 300);
+    let header = JournalHeader {
+        magic: permfs::journal::JOURNAL_MAGIC,
+        version: 1,
+        state: TxState::Running,
+        head_seq: 1,
+        tail_seq: 1,
+        first_block: BlockAddr::new(node_id, volume_id, 0, 301),
+        block_count: 64,
+        max_transaction: MAX_TRANSACTION_BLOCKS as u32,
+        checksum: 0,
+    };
+
+    // Write journal header
+    let mut header_buf = [0u8; BLOCK_SIZE];
+    header.serialize(&mut header_buf);
+    device.write_block(journal_start, &header_buf).unwrap();
+
+    // Create journal and commit a transaction
+    let journal = Journal::new(device.clone(), header);
+    let mut tx = journal.begin();
+
+    // Write test data to a specific block
+    let dest_block = BlockAddr::new(node_id, volume_id, 0, 500);
+    let mut payload = [0u8; BLOCK_SIZE];
+    payload[..16].copy_from_slice(b"recovery_test!!\0");
+    tx.write(dest_block, &payload).unwrap();
+
+    // Commit but don't checkpoint (simulating crash after commit)
+    journal.commit(&mut tx).unwrap();
+
+    // Update header to reflect uncommitted transaction
+    let crash_header = JournalHeader {
+        head_seq: tx.sequence() + 1,
+        tail_seq: tx.sequence(),
+        ..header
+    };
+    let mut crash_header_buf = [0u8; BLOCK_SIZE];
+    crash_header.serialize(&mut crash_header_buf);
+    device.write_block(journal_start, &crash_header_buf).unwrap();
+    device.sync().unwrap();
+
+    // Verify destination block is still empty (not checkpointed)
+    let mut check_buf = [0u8; BLOCK_SIZE];
+    device.read_block(dest_block, &mut check_buf).unwrap();
+    assert_ne!(&check_buf[..16], b"recovery_test!!\0", "Data should not be at destination yet");
+
+    // Now simulate reopening - create a fresh device to same file
+    drop(device);
+
+    // Re-open using the lower-level journal recovery
+    let device2 = FileBlockDevice::open_existing(&img, node_id, volume_id).unwrap();
+
+    // Read journal header
+    let mut header_buf2 = [0u8; BLOCK_SIZE];
+    device2.read_block(journal_start, &mut header_buf2).unwrap();
+    let header2 = JournalHeader::deserialize(&header_buf2);
+
+    // Perform recovery
+    let journal2 = Journal::new(device2.clone(), header2);
+    let recovered = journal2.recover().unwrap();
+
+    assert!(!recovered.is_empty(), "Should have recovered at least one transaction");
+    assert_eq!(recovered.len(), 1);
+
+    // Verify data was replayed to destination
+    let mut out = [0u8; BLOCK_SIZE];
+    device2.read_block(dest_block, &mut out).unwrap();
+    assert_eq!(&out[..16], b"recovery_test!!\0", "Data should be recovered");
+}
+
 #[cfg(feature = "network")]
 #[test]
 fn tcp_transport_roundtrip() {

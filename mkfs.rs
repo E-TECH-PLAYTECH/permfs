@@ -311,6 +311,17 @@ pub enum MountFlags {
     Sync = 4,
 }
 
+/// Statistics from journal recovery
+#[derive(Debug, Default, Clone)]
+pub struct RecoveryStats {
+    /// Number of transactions replayed
+    pub transactions_replayed: u64,
+    /// Number of blocks written during replay
+    pub blocks_replayed: u64,
+    /// Whether recovery was needed
+    pub recovery_needed: bool,
+}
+
 impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
     /// Mount filesystem — read superblock, verify, set up state
     pub fn mount(&self, node_id: u64, volume_id: u32) -> FsResult<Superblock> {
@@ -372,5 +383,87 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
 
         self.mounted.fetch_sub(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Recover journal after crash — replay committed but not checkpointed transactions
+    #[cfg(feature = "std")]
+    pub fn recover_journal(&self, sb: &Superblock) -> FsResult<RecoveryStats> {
+        use crate::journal::{Journal, JournalHeader, JOURNAL_MAGIC};
+
+        // Read journal header from disk
+        let mut buf = [0u8; BLOCK_SIZE];
+        self.read_block(sb.journal_start, &mut buf)?;
+
+        let header = JournalHeader::deserialize(&buf);
+
+        // Verify journal magic
+        if header.magic != JOURNAL_MAGIC {
+            // No valid journal, nothing to recover
+            return Ok(RecoveryStats::default());
+        }
+
+        // Check if recovery is needed (uncommitted transactions exist)
+        if header.tail_seq >= header.head_seq {
+            // Journal is clean, no recovery needed
+            return Ok(RecoveryStats::default());
+        }
+
+        // Create a wrapper that implements BlockDevice for our local_device
+        let journal = Journal::new(JournalBlockDevice::new(&self.local_device), header);
+
+        // Perform recovery
+        let recovered = journal.recover().map_err(|_| IoError::Corrupted)?;
+
+        let stats = RecoveryStats {
+            transactions_replayed: recovered.len() as u64,
+            blocks_replayed: 0, // We don't track this currently
+            recovery_needed: !recovered.is_empty(),
+        };
+
+        if stats.recovery_needed {
+            // Update journal header to mark recovery complete
+            let new_header = JournalHeader {
+                tail_seq: header.head_seq,
+                ..header
+            };
+            let mut header_buf = [0u8; BLOCK_SIZE];
+            new_header.serialize(&mut header_buf);
+            self.write_block(sb.journal_start, &header_buf)?;
+            self.local_device.sync()?;
+        }
+
+        Ok(stats)
+    }
+}
+
+/// Wrapper to adapt a reference to BlockDevice for Journal use
+#[cfg(feature = "std")]
+struct JournalBlockDevice<'a, B: BlockDevice> {
+    inner: &'a B,
+}
+
+#[cfg(feature = "std")]
+impl<'a, B: BlockDevice> JournalBlockDevice<'a, B> {
+    fn new(inner: &'a B) -> Self {
+        Self { inner }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<B: BlockDevice> BlockDevice for JournalBlockDevice<'_, B> {
+    fn read_block(&self, addr: BlockAddr, buf: &mut [u8; BLOCK_SIZE]) -> FsResult<()> {
+        self.inner.read_block(addr, buf)
+    }
+
+    fn write_block(&self, addr: BlockAddr, buf: &[u8; BLOCK_SIZE]) -> FsResult<()> {
+        self.inner.write_block(addr, buf)
+    }
+
+    fn sync(&self) -> FsResult<()> {
+        self.inner.sync()
+    }
+
+    fn trim(&self, addr: BlockAddr) -> FsResult<()> {
+        self.inner.trim(addr)
     }
 }

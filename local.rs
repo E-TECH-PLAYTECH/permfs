@@ -359,6 +359,15 @@ impl DiskFsBuilder {
         let mut fs = PermFs::new(self.node_id, device, transport.clone());
         let sb = fs.mount(self.node_id, self.volume_id)?;
 
+        // Perform journal recovery before normal operation
+        let recovery_stats = fs.recover_journal(&sb)?;
+        if recovery_stats.recovery_needed {
+            eprintln!(
+                "PermFS: Recovered {} transactions from journal",
+                recovery_stats.transactions_replayed
+            );
+        }
+
         // Set up the block allocator
         // Calculate data_start: journal_start + journal_blocks
         // We hardcode journal_blocks = 128 to match the build() method
