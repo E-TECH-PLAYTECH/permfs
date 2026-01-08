@@ -17,6 +17,88 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const TTL: Duration = Duration::from_secs(1);
 
+// ============================================================================
+// MOUNT OPTIONS
+// ============================================================================
+
+/// Mount options for PermFS
+#[derive(Debug, Clone, Default)]
+pub struct MountOptions {
+    /// Mount filesystem read-only (reject all writes)
+    pub read_only: bool,
+    /// Don't update access times on read
+    pub noatime: bool,
+    /// Update atime only if atime < mtime or atime < ctime (Linux default)
+    pub relatime: bool,
+    /// Synchronous I/O (flush after every write)
+    pub sync: bool,
+}
+
+impl MountOptions {
+    /// Create default mount options (read-write, relatime)
+    pub fn new() -> Self {
+        Self {
+            read_only: false,
+            noatime: false,
+            relatime: true, // Default like Linux
+            sync: false,
+        }
+    }
+
+    /// Parse mount options from a comma-separated string
+    /// e.g., "ro,noatime" or "rw,sync"
+    pub fn parse(options: &str) -> Self {
+        let mut opts = Self::new();
+
+        for opt in options.split(',') {
+            match opt.trim() {
+                "ro" => opts.read_only = true,
+                "rw" => opts.read_only = false,
+                "noatime" => {
+                    opts.noatime = true;
+                    opts.relatime = false;
+                }
+                "atime" => {
+                    opts.noatime = false;
+                }
+                "relatime" => {
+                    opts.relatime = true;
+                    opts.noatime = false;
+                }
+                "norelatime" => opts.relatime = false,
+                "sync" => opts.sync = true,
+                "async" => opts.sync = false,
+                _ => {} // Ignore unknown options
+            }
+        }
+
+        opts
+    }
+
+    /// Check if atime should be updated based on current options
+    /// and the relationship between atime, mtime, and ctime
+    pub fn should_update_atime(&self, atime: u64, mtime: u64, ctime: u64) -> bool {
+        if self.noatime {
+            return false;
+        }
+
+        if self.relatime {
+            // Update atime if it's older than mtime or ctime
+            // or if it's more than 24 hours old
+            let day_ns = 24 * 60 * 60 * 1_000_000_000u64;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+
+            atime < mtime || atime < ctime || (now - atime) > day_ns
+        } else {
+            // Always update atime
+            true
+        }
+    }
+}
+
 // FUSE uses inode 1 for root (FUSE_ROOT_ID), PermFS uses inode 0
 // FUSE inode 0 is invalid/unused, so we offset by 1:
 //   FUSE 1 <-> PermFS 0 (root)
@@ -85,16 +167,22 @@ pub struct FuseFs<B: BlockDevice, T: ClusterTransport> {
     open_files: Mutex<HashMap<u64, OpenFile>>,
     next_fh: Mutex<u64>,
     lock_table: LockTable,
+    mount_options: MountOptions,
 }
 
 impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> FuseFs<B, T> {
     pub fn new(fs: Arc<PermFs<B, T>>, sb: Superblock) -> Self {
+        Self::with_options(fs, sb, MountOptions::new())
+    }
+
+    pub fn with_options(fs: Arc<PermFs<B, T>>, sb: Superblock, options: MountOptions) -> Self {
         Self {
             fs,
             superblock: RwLock::new(sb),
             open_files: Mutex::new(HashMap::new()),
             next_fh: Mutex::new(1),
             lock_table: LockTable::new(),
+            mount_options: options,
         }
     }
 
@@ -136,12 +224,44 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> FuseFs<B, T> {
     }
 
     pub fn mount(self, mountpoint: &std::path::Path) -> std::io::Result<()> {
-        let options = vec![
+        let mut options = vec![
             MountOption::FSName("permfs".to_string()),
             MountOption::AutoUnmount,
             MountOption::DefaultPermissions,
         ];
+
+        if self.mount_options.read_only {
+            options.push(MountOption::RO);
+        } else {
+            options.push(MountOption::RW);
+        }
+
+        if self.mount_options.noatime {
+            options.push(MountOption::NoAtime);
+        }
+
+        if self.mount_options.sync {
+            options.push(MountOption::Sync);
+        }
+
         fuser::mount2(self, mountpoint, &options)
+    }
+
+    /// Check if filesystem is mounted read-only
+    fn is_read_only(&self) -> bool {
+        self.mount_options.read_only
+    }
+
+    /// Update atime if mount options allow it
+    fn maybe_update_atime(&self, ino: u64, inode: &Inode, sb: &Superblock) {
+        if self.mount_options.should_update_atime(inode.atime, inode.mtime, inode.ctime) {
+            let mut updated = *inode;
+            updated.atime = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            let _ = self.fs.write_inode(ino, &updated, sb);
+        }
     }
 }
 
@@ -205,6 +325,11 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        if self.is_read_only() {
+            reply.error(libc::EROFS);
+            return;
+        }
+
         let sb = self.sb();
         let permfs_ino = fuse_to_permfs_ino(ino);
         let mut inode = match self.fs.read_inode(permfs_ino, &sb) {
@@ -261,6 +386,11 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        if self.is_read_only() {
+            reply.error(libc::EROFS);
+            return;
+        }
+
         let sb = self.sb();
         let name = name.to_string_lossy();
         let parent = fuse_to_permfs_ino(parent);
@@ -342,6 +472,10 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         _rdev: u32,
         reply: ReplyEntry,
     ) {
+        if self.is_read_only() {
+            reply.error(libc::EROFS);
+            return;
+        }
         let sb = self.sb();
         let name = name.to_string_lossy();
         let parent = fuse_to_permfs_ino(parent);
@@ -400,6 +534,10 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         _flags: i32,
         reply: ReplyCreate,
     ) {
+        if self.is_read_only() {
+            reply.error(libc::EROFS);
+            return;
+        }
         let sb = self.sb();
         let name = name.to_string_lossy();
         let parent = fuse_to_permfs_ino(parent);
@@ -458,6 +596,10 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        if self.is_read_only() {
+            reply.error(libc::EROFS);
+            return;
+        }
         let sb = self.sb();
         let name = name.to_string_lossy();
         let parent = fuse_to_permfs_ino(parent);
@@ -510,6 +652,10 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
     }
 
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        if self.is_read_only() {
+            reply.error(libc::EROFS);
+            return;
+        }
         let sb = self.sb();
         let name = name.to_string_lossy();
         let parent = fuse_to_permfs_ino(parent);
@@ -629,6 +775,8 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         let mut buf = vec![0u8; size as usize];
         match self.fs.read_file(&inode, offset as u64, &mut buf) {
             Ok(read) => {
+                // Update atime based on mount options
+                self.maybe_update_atime(file_ino, &inode, &sb);
                 buf.truncate(read);
                 reply.data(&buf);
             }
@@ -648,6 +796,11 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         _lock: Option<u64>,
         reply: ReplyWrite,
     ) {
+        if self.is_read_only() {
+            reply.error(libc::EROFS);
+            return;
+        }
+
         let sb = self.sb();
 
         let file_ino = {
@@ -674,6 +827,10 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
                 if let Err(_) = self.fs.write_inode(file_ino, &inode, &sb) {
                     reply.error(libc::EIO);
                     return;
+                }
+                // Sync if mount option requires it
+                if self.mount_options.sync {
+                    let _ = self.fs.local_device.sync();
                 }
                 reply.written(written as u32);
             }
@@ -813,6 +970,10 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         target: &std::path::Path,
         reply: ReplyEntry,
     ) {
+        if self.is_read_only() {
+            reply.error(libc::EROFS);
+            return;
+        }
         let sb = self.sb();
         let parent = fuse_to_permfs_ino(parent);
         let link_name = link_name.to_string_lossy();
@@ -854,6 +1015,10 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
+        if self.is_read_only() {
+            reply.error(libc::EROFS);
+            return;
+        }
         let sb = self.sb();
         let ino = fuse_to_permfs_ino(ino);
         let newparent = fuse_to_permfs_ino(newparent);
@@ -884,6 +1049,10 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         _flags: u32,
         reply: ReplyEmpty,
     ) {
+        if self.is_read_only() {
+            reply.error(libc::EROFS);
+            return;
+        }
         use std::os::unix::ffi::OsStrExt;
         let sb = self.sb();
         let parent = fuse_to_permfs_ino(parent);
@@ -1097,6 +1266,10 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         _position: u32,
         reply: ReplyEmpty,
     ) {
+        if self.is_read_only() {
+            reply.error(libc::EROFS);
+            return;
+        }
         let sb = self.sb();
         let ino = fuse_to_permfs_ino(ino);
         let name = name.to_string_lossy();
@@ -1132,6 +1305,10 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
     }
 
     fn removexattr(&mut self, _req: &Request, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        if self.is_read_only() {
+            reply.error(libc::EROFS);
+            return;
+        }
         let sb = self.sb();
         let ino = fuse_to_permfs_ino(ino);
         let name = name.to_string_lossy();
@@ -1198,6 +1375,10 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         mode: i32,
         reply: ReplyEmpty,
     ) {
+        if self.is_read_only() {
+            reply.error(libc::EROFS);
+            return;
+        }
         let sb = self.sb();
         let ino = fuse_to_permfs_ino(ino);
 
