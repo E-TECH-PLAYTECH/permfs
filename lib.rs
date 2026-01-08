@@ -77,6 +77,8 @@ pub mod locking;
 #[cfg(feature = "std")]
 pub mod xattr;
 #[cfg(feature = "std")]
+pub mod quota;
+#[cfg(feature = "std")]
 pub mod local;
 #[cfg(feature = "std")]
 pub mod mock;
@@ -315,6 +317,8 @@ pub struct Superblock {
     pub errors_behavior: u16,
     pub first_inode_table: BlockAddr,
     pub journal_start: BlockAddr,
+    pub user_quota_block: BlockAddr,
+    pub group_quota_block: BlockAddr,
     pub root_inode: u64,
     pub checksum: u64,
 }

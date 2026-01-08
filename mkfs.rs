@@ -100,6 +100,8 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
                 inode_table_start,
             ),
             journal_start: BlockAddr::new(params.node_id, params.volume_id, 0, journal_start),
+            user_quota_block: BlockAddr::NULL,
+            group_quota_block: BlockAddr::NULL,
             root_inode: 0,
             checksum: 0,
         };
@@ -153,8 +155,10 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
         buf[154..156].copy_from_slice(&sb.errors_behavior.to_le_bytes());
         buf[156..188].copy_from_slice(&sb.first_inode_table.to_bytes());
         buf[188..220].copy_from_slice(&sb.journal_start.to_bytes());
-        buf[220..228].copy_from_slice(&sb.root_inode.to_le_bytes());
-        buf[228..236].copy_from_slice(&sb.checksum.to_le_bytes());
+        buf[220..252].copy_from_slice(&sb.user_quota_block.to_bytes());
+        buf[252..284].copy_from_slice(&sb.group_quota_block.to_bytes());
+        buf[284..292].copy_from_slice(&sb.root_inode.to_le_bytes());
+        buf[292..300].copy_from_slice(&sb.checksum.to_le_bytes());
     }
 
     fn clone_superblock(&self, sb: &Superblock) -> Superblock {
@@ -177,6 +181,8 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
             errors_behavior: sb.errors_behavior,
             first_inode_table: sb.first_inode_table,
             journal_start: sb.journal_start,
+            user_quota_block: sb.user_quota_block,
+            group_quota_block: sb.group_quota_block,
             root_inode: sb.root_inode,
             checksum: sb.checksum,
         }
@@ -363,8 +369,10 @@ impl<B: BlockDevice, T: ClusterTransport> PermFs<B, T> {
             errors_behavior: u16::from_le_bytes(buf[154..156].try_into().unwrap()),
             first_inode_table: BlockAddr::from_bytes(buf[156..188].try_into().unwrap()),
             journal_start: BlockAddr::from_bytes(buf[188..220].try_into().unwrap()),
-            root_inode: u64::from_le_bytes(buf[220..228].try_into().unwrap()),
-            checksum: u64::from_le_bytes(buf[228..236].try_into().unwrap()),
+            user_quota_block: BlockAddr::from_bytes(buf[220..252].try_into().unwrap()),
+            group_quota_block: BlockAddr::from_bytes(buf[252..284].try_into().unwrap()),
+            root_inode: u64::from_le_bytes(buf[284..292].try_into().unwrap()),
+            checksum: u64::from_le_bytes(buf[292..300].try_into().unwrap()),
         })
     }
 

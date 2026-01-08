@@ -211,6 +211,8 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> FuseFs<B, T> {
             errors_behavior: sb.errors_behavior,
             first_inode_table: sb.first_inode_table,
             journal_start: sb.journal_start,
+            user_quota_block: sb.user_quota_block,
+            group_quota_block: sb.group_quota_block,
             root_inode: sb.root_inode,
             checksum: sb.checksum,
         }
