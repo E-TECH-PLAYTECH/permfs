@@ -354,6 +354,9 @@ pub enum IoError {
     ChecksumMismatch,
     LockContention,
     ReadOnly,
+    NoSpace,
+    DirectoryNotEmpty,
+    AlreadyExists,
 }
 
 /// Filesystem operation result

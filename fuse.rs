@@ -795,4 +795,161 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
             BLOCK_SIZE as u32,
         );
     }
+
+    fn symlink(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        link_name: &OsStr,
+        target: &std::path::Path,
+        reply: ReplyEntry,
+    ) {
+        let sb = self.sb();
+        let parent = fuse_to_permfs_ino(parent);
+        let link_name = link_name.to_string_lossy();
+        let target = target.to_string_lossy();
+
+        match self.fs.symlink_impl(parent, link_name.as_bytes(), target.as_bytes(), &sb) {
+            Ok(ino) => {
+                match self.fs.read_inode(ino, &sb) {
+                    Ok(inode) => {
+                        reply.entry(&TTL, &inode_to_attr(permfs_to_fuse_ino(ino), &inode), 0);
+                    }
+                    Err(_) => reply.error(libc::EIO),
+                }
+            }
+            Err(IoError::NoSpace) => reply.error(libc::ENOSPC),
+            Err(IoError::NotFound) => reply.error(libc::ENOENT),
+            Err(_) => reply.error(libc::EIO),
+        }
+    }
+
+    fn readlink(&mut self, _req: &Request, ino: u64, reply: ReplyData) {
+        let sb = self.sb();
+        let ino = fuse_to_permfs_ino(ino);
+
+        let mut buf = [0u8; 4096];
+        match self.fs.readlink_impl(ino, &mut buf, &sb) {
+            Ok(len) => reply.data(&buf[..len]),
+            Err(IoError::InvalidAddress) => reply.error(libc::EINVAL),
+            Err(IoError::NotFound) => reply.error(libc::ENOENT),
+            Err(_) => reply.error(libc::EIO),
+        }
+    }
+
+    fn link(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        newparent: u64,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        let sb = self.sb();
+        let ino = fuse_to_permfs_ino(ino);
+        let newparent = fuse_to_permfs_ino(newparent);
+        let newname = newname.to_string_lossy();
+
+        match self.fs.link_impl(ino, newparent, newname.as_bytes(), &sb) {
+            Ok(()) => {
+                match self.fs.read_inode(ino, &sb) {
+                    Ok(inode) => {
+                        reply.entry(&TTL, &inode_to_attr(permfs_to_fuse_ino(ino), &inode), 0);
+                    }
+                    Err(_) => reply.error(libc::EIO),
+                }
+            }
+            Err(IoError::NotFound) => reply.error(libc::ENOENT),
+            Err(IoError::NoSpace) => reply.error(libc::ENOSPC),
+            Err(_) => reply.error(libc::EIO),
+        }
+    }
+
+    fn rename(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        _flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        use std::os::unix::ffi::OsStrExt;
+        let sb = self.sb();
+        let parent = fuse_to_permfs_ino(parent);
+        let newparent = fuse_to_permfs_ino(newparent);
+
+        match self.fs.rename_impl(parent, name.as_bytes(), newparent, newname.as_bytes(), &sb) {
+            Ok(()) => reply.ok(),
+            Err(IoError::NotFound) => reply.error(libc::ENOENT),
+            Err(IoError::DirectoryNotEmpty) => reply.error(libc::ENOTEMPTY),
+            Err(_) => reply.error(libc::EIO),
+        }
+    }
+
+    fn access(&mut self, req: &Request, ino: u64, mask: i32, reply: ReplyEmpty) {
+        let sb = self.sb();
+        let ino = fuse_to_permfs_ino(ino);
+
+        let inode = match self.fs.read_inode(ino, &sb) {
+            Ok(i) => i,
+            Err(_) => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        // F_OK (existence check)
+        if mask == libc::F_OK {
+            reply.ok();
+            return;
+        }
+
+        let uid = req.uid();
+        let gid = req.gid();
+        let mode = inode.mode;
+
+        // Root can access anything (for read/write; execute still needs x bit)
+        if uid == 0 {
+            if mask & libc::X_OK != 0 {
+                // Root can execute if any execute bit is set
+                if mode & 0o111 != 0 {
+                    reply.ok();
+                } else {
+                    reply.error(libc::EACCES);
+                }
+            } else {
+                reply.ok();
+            }
+            return;
+        }
+
+        let (shift, _) = if uid == inode.uid {
+            (6, "owner")
+        } else if gid == inode.gid {
+            (3, "group")
+        } else {
+            (0, "other")
+        };
+
+        let perms = (mode >> shift) & 0o7;
+        let mut granted = true;
+
+        if mask & libc::R_OK != 0 && perms & 0o4 == 0 {
+            granted = false;
+        }
+        if mask & libc::W_OK != 0 && perms & 0o2 == 0 {
+            granted = false;
+        }
+        if mask & libc::X_OK != 0 && perms & 0o1 == 0 {
+            granted = false;
+        }
+
+        if granted {
+            reply.ok();
+        } else {
+            reply.error(libc::EACCES);
+        }
+    }
 }
