@@ -2,12 +2,13 @@
 
 #![cfg(feature = "fuse")]
 
+use crate::locking::{FileLock, LockResult, LockTable, LockType};
 use crate::sync::{Arc, Mutex, RwLock};
 use crate::vfs::OpenFlags;
 use crate::*;
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -82,6 +83,7 @@ pub struct FuseFs<B: BlockDevice, T: ClusterTransport> {
     superblock: RwLock<Superblock>,
     open_files: Mutex<HashMap<u64, OpenFile>>,
     next_fh: Mutex<u64>,
+    lock_table: LockTable,
 }
 
 impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> FuseFs<B, T> {
@@ -91,6 +93,7 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> FuseFs<B, T> {
             superblock: RwLock::new(sb),
             open_files: Mutex::new(HashMap::new()),
             next_fh: Mutex::new(1),
+            lock_table: LockTable::new(),
         }
     }
 
@@ -677,7 +680,12 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
         }
     }
 
-    fn flush(&mut self, _req: &Request, _ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+    fn flush(&mut self, _req: &Request, ino: u64, _fh: u64, lock_owner: u64, reply: ReplyEmpty) {
+        let ino = fuse_to_permfs_ino(ino);
+
+        // Release all locks held by this owner on this inode
+        self.lock_table.release_owner(ino, lock_owner);
+
         // Sync the device on flush
         match self.fs.local_device.sync() {
             Ok(_) => reply.ok(),
@@ -950,6 +958,101 @@ impl<B: BlockDevice + 'static, T: ClusterTransport + 'static> Filesystem for Fus
             reply.ok();
         } else {
             reply.error(libc::EACCES);
+        }
+    }
+
+    fn getlk(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        lock_owner: u64,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        reply: ReplyLock,
+    ) {
+        let ino = fuse_to_permfs_ino(ino);
+        let lock_type = match LockType::from_libc(typ) {
+            Some(t) => t,
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        // Calculate length from start/end (end is exclusive, 0 means EOF)
+        let len = if end == 0 || end == u64::MAX {
+            0 // To EOF
+        } else {
+            end.saturating_sub(start)
+        };
+
+        let proposed = FileLock::new(lock_owner, start, len, lock_type);
+
+        match self.lock_table.test_lock(ino, &proposed) {
+            Some(conflict) => {
+                // Return the conflicting lock
+                let end = if conflict.len == 0 { 0 } else { conflict.start + conflict.len };
+                reply.locked(
+                    conflict.start,
+                    end,
+                    conflict.lock_type.to_libc(),
+                    pid,
+                );
+            }
+            None => {
+                // No conflict - return unlock to indicate lock would succeed
+                reply.locked(0, 0, libc::F_UNLCK as i32, 0);
+            }
+        }
+    }
+
+    fn setlk(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        lock_owner: u64,
+        start: u64,
+        end: u64,
+        typ: i32,
+        _pid: u32,
+        block: bool,
+        reply: ReplyEmpty,
+    ) {
+        let ino = fuse_to_permfs_ino(ino);
+        let lock_type = match LockType::from_libc(typ) {
+            Some(t) => t,
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        // Calculate length from start/end
+        let len = if end == 0 || end == u64::MAX {
+            0 // To EOF
+        } else {
+            end.saturating_sub(start)
+        };
+
+        let lock = FileLock::new(lock_owner, start, len, lock_type);
+
+        match self.lock_table.try_lock(ino, lock) {
+            LockResult::Acquired | LockResult::Released => {
+                reply.ok();
+            }
+            LockResult::WouldBlock(_) => {
+                if block {
+                    // For blocking locks, we'd need async support
+                    // For now, just return EAGAIN and let the caller retry
+                    reply.error(libc::EAGAIN);
+                } else {
+                    reply.error(libc::EAGAIN);
+                }
+            }
         }
     }
 }

@@ -73,6 +73,8 @@ pub mod file_device;
 #[cfg(feature = "fuse")]
 pub mod fuse;
 #[cfg(feature = "std")]
+pub mod locking;
+#[cfg(feature = "std")]
 pub mod local;
 #[cfg(feature = "std")]
 pub mod mock;
