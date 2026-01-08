@@ -80,6 +80,8 @@ pub mod xattr;
 pub mod quota;
 #[cfg(feature = "compression")]
 pub mod compress;
+#[cfg(feature = "encryption")]
+pub mod crypto;
 #[cfg(feature = "std")]
 pub mod local;
 #[cfg(feature = "std")]
